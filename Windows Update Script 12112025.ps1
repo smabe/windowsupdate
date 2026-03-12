@@ -286,13 +286,26 @@ function Wait-ForUpdateJobs {
     $waitingStartTime   = @{}  # first time each machine entered "Waiting to start"
     $jobStartRetryCount = @{}  # cumulative retry attempts per machine
 
+    # Visual separator — everything above this line is preserved across refreshes
+    Write-Host "`n═══ Live Monitoring (refreshes every ${CheckIntervalSeconds}s) ═══" -ForegroundColor DarkGray
+    $monitorTop = [Console]::CursorTop
+
     # Monitor loop
     while ((Get-Date) -lt $endTime) {
         $stillRunning = 0
         $completed = 0
         $failed = 0
-        
-        Clear-Host
+
+        # Reset cursor to monitoring area — preserves Phase 1 output above
+        [Console]::SetCursorPosition(0, $monitorTop)
+        $clearLine = " " * [Console]::WindowWidth
+        $clearEnd = [math]::Min($monitorTop + [Console]::WindowHeight, [Console]::BufferHeight - 1)
+        for ($ci = $monitorTop; $ci -lt $clearEnd; $ci++) {
+            [Console]::SetCursorPosition(0, $ci)
+            [Console]::Write($clearLine)
+        }
+        [Console]::SetCursorPosition(0, $monitorTop)
+
         Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Checking status..." -ForegroundColor Gray
         $loopCount++
 
