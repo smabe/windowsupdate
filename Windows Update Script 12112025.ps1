@@ -33,6 +33,10 @@ param(
     [Parameter(Mandatory=$false)]
     [int]$WSManTimeoutSeconds = 10,
 
+    # Maximum number of concurrent Phase 1 job-start operations
+    [Parameter(Mandatory=$false)]
+    [int]$ThrottleLimit = 50,
+
     # Regenerate the HTML report from an existing session folder (skips Phases 1-3)
     [switch]$ReportOnly,
 
@@ -88,6 +92,20 @@ if ($ReportOnly) {
         $seen[$key] = $true
         return $true
     })
+
+    # Ensure Verified field exists on all update records (old CSVs may lack it)
+    $allUpdateData | ForEach-Object {
+        if (-not ($_.PSObject.Properties.Name -contains 'Verified')) {
+            $_ | Add-Member -NotePropertyName Verified -NotePropertyValue 'N/A' -Force
+        }
+    }
+
+    # Ensure PreviousRunArchive field exists on summary objects (old CSVs may lack it)
+    $computerSummary | ForEach-Object {
+        if (-not ($_.PSObject.Properties.Name -contains 'PreviousRunArchive')) {
+            $_ | Add-Member -NotePropertyName PreviousRunArchive -NotePropertyValue '' -Force
+        }
+    }
 
     # Recalculate per-computer summary counts from deduplicated data
     $updatesByComputer = $allUpdateData | Group-Object ComputerName
@@ -268,13 +286,26 @@ function Wait-ForUpdateJobs {
     $waitingStartTime   = @{}  # first time each machine entered "Waiting to start"
     $jobStartRetryCount = @{}  # cumulative retry attempts per machine
 
+    # Visual separator — everything above this line is preserved across refreshes
+    Write-Host "`n═══ Live Monitoring (refreshes every ${CheckIntervalSeconds}s) ═══" -ForegroundColor DarkGray
+    $monitorTop = [Console]::CursorTop
+
     # Monitor loop
     while ((Get-Date) -lt $endTime) {
         $stillRunning = 0
         $completed = 0
         $failed = 0
-        
-        Clear-Host
+
+        # Reset cursor to monitoring area — preserves Phase 1 output above
+        [Console]::SetCursorPosition(0, $monitorTop)
+        $clearLine = " " * [Console]::WindowWidth
+        $clearEnd = [math]::Min($monitorTop + [Console]::WindowHeight, [Console]::BufferHeight - 1)
+        for ($ci = $monitorTop; $ci -lt $clearEnd; $ci++) {
+            [Console]::SetCursorPosition(0, $ci)
+            [Console]::Write($clearLine)
+        }
+        [Console]::SetCursorPosition(0, $monitorTop)
+
         Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Checking status..." -ForegroundColor Gray
         $loopCount++
 
@@ -328,6 +359,21 @@ function Wait-ForUpdateJobs {
                 continue
             }
             
+            # ── Quick TCP pre-check to avoid expensive Invoke-Command on offline machines ──
+            $target = if ($computer.IP) { $computer.IP } else { $computer.Name }
+            $tcpReachable = $false
+            try {
+                $tcp = New-Object System.Net.Sockets.TcpClient
+                $ar = $tcp.BeginConnect($target, 5985, $null, $null)
+                $tcpReachable = $ar.AsyncWaitHandle.WaitOne($WSManTimeoutSeconds * 1000, $false) -and $tcp.Connected
+                $tcp.Close()
+            } catch {}
+            if (-not $tcpReachable) {
+                $computerStatus[$computer.Name] = "Unreachable"
+                $stillRunning++
+                continue
+            }
+
             # ── Remote status query with retry on transient failures ────────────
             $jobStatus = $null
             for ($retryAttempt = 0; $retryAttempt -le $MaxRetries; $retryAttempt++) {
@@ -386,8 +432,15 @@ function Wait-ForUpdateJobs {
                             # Check for active Windows Update processes
                             $updateProcesses = @()
                             try {
-                                $updateProcesses = Get-Process -Name "TrustedInstaller", "TiWorker", "wuauclt" -ErrorAction SilentlyContinue
+                                $updateProcesses = Get-Process -Name "TrustedInstaller", "TiWorker", "wuauclt", "msiexec", "wusa" -ErrorAction SilentlyContinue
                             } catch { }
+
+                            # Check for WUJob start failure marker
+                            $wuJobError = $null
+                            $wuJobErrorPath = "$remoteTempPath\wujob_error.txt"
+                            if (Test-Path $wuJobErrorPath) {
+                                $wuJobError = (Get-Content $wuJobErrorPath -Raw).Trim()
+                            }
 
                             return @{
                                 TasksRunning                = ($wuTasks.Count -gt 0)
@@ -400,6 +453,7 @@ function Wait-ForUpdateJobs {
                                 LogComplete                 = $logComplete
                                 LogSize                     = $logSize
                                 UpdateProcessesRunning      = ($updateProcesses.Count -gt 0)
+                                WUJobError                  = $wuJobError
                                 ComputerName                = $env:COMPUTERNAME
                             }
                         } -ErrorAction Stop
@@ -424,13 +478,23 @@ function Wait-ForUpdateJobs {
                 $wuJobDetectionWarned[$computer.Name] = $true
             }
 
+            # ── Check for WUJob start failure ────────────────────────────────
+            if ($jobStatus.WUJobError) {
+                Write-Host "  ⛔ $($computer.Name): WUJob failed to start — $($jobStatus.WUJobError)" -ForegroundColor Red
+                $computerStatus[$computer.Name] = "JobStartFailed"
+                $completedComputers[$computer.Name] = $true
+                $completed++
+                continue
+            }
+
             # ── Completion logic ─────────────────────────────────────────────
             # Primary: explicit completion marker AND log — both must be from the current session
             # (newer than update_started.txt) to prevent false positives from previous-run artifacts
             $definitelyDone = $jobStatus.CompletedIsCurrentSession -and $jobStatus.LogIsCurrentSession
             # Fallback heuristic: log is stable, current-session, no tasks or WU jobs running
             $heuristicDone  = $jobStatus.LogIsCurrentSession -and $jobStatus.LogComplete -and
-                              -not $jobStatus.TasksRunning -and -not $jobStatus.JobsRunning
+                              -not $jobStatus.TasksRunning -and -not $jobStatus.JobsRunning -and
+                              -not $jobStatus.UpdateProcessesRunning
 
             if ($definitelyDone -or $heuristicDone) {
                 $how = if ($definitelyDone) { "(marker)" } else { "(heuristic)" }
@@ -565,20 +629,86 @@ if ($computers.Count -eq 0) {
 }
 Write-Host "Loaded $($computers.Count) computers from CSV" -ForegroundColor Green
 
+# ── Credential pre-validation ─────────────────────────────────────────────
+# Test credentials against a reachable machine before launching all parallel jobs.
+# Catches bad passwords early instead of failing 91+ machines identically.
+Write-Host "`nValidating credentials..." -ForegroundColor Cyan
+$credValid = $false
+$credTestCount = 0
+$credTestMax = [math]::Min(3, $computers.Count)
+foreach ($testTarget in $computers) {
+    $credTestCount++
+    $target = if ($testTarget.IP) { $testTarget.IP } else { $testTarget.Name }
+    try {
+        # Quick TCP check first
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $ar = $tcp.BeginConnect($target, 5985, $null, $null)
+        $tcpOk = $ar.AsyncWaitHandle.WaitOne($WSManTimeoutSeconds * 1000, $false) -and $tcp.Connected
+        $tcp.Close()
+        if (-not $tcpOk) { continue }
+
+        Invoke-Command -ComputerName $target -Credential $cred -ScriptBlock { $env:COMPUTERNAME } -ErrorAction Stop | Out-Null
+        Write-Host "  Credentials validated against $($testTarget.Name)" -ForegroundColor Green
+        $credValid = $true
+        break
+    } catch {
+        if ($_.Exception.Message -match 'Access is denied|user name or password|logon failure|credentials') {
+            Write-Host "  ERROR: Credential validation failed — $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "  Please verify your username and password. Exiting..." -ForegroundColor Red
+            exit
+        }
+        # Non-credential error (machine-specific) — try next machine
+    }
+}
+if (-not $credValid) {
+    Write-Host "  Warning: Could not validate credentials (first $credTestCount machine(s) unreachable). Proceeding..." -ForegroundColor Yellow
+}
+
 # Job-start scriptblock — shared by Phase 1 and the late-arrival retry logic.
-# Passed via $using:jobStartBlock in the parallel loop, and as -JobStartScript to
-# Wait-ForUpdateJobs for late-arrival retries.
+# Serialized as a string for Phase 1 (ForEach-Object -Parallel cannot pass scriptblocks
+# via $using:), and passed directly as -JobStartScript to Wait-ForUpdateJobs.
 $jobStartBlock = {
     param($remoteTempPath)
     # Ensure temp directory exists
     if (-not (Test-Path $remoteTempPath)) {
         New-Item $remoteTempPath -ItemType Directory -Force | Out-Null
     }
+
+    # Archive previous run's artifacts if they exist and are from today (preserve for diff)
+    $logPath = "$remoteTempPath\updatelog.csv"
+    if (Test-Path $logPath) {
+        $logTime = (Get-Item $logPath).LastWriteTime
+        if ($logTime.Date -eq (Get-Date).Date) {
+            $archiveDir = "$remoteTempPath\archive_$($logTime.ToString('HHmmss'))"
+            New-Item $archiveDir -ItemType Directory -Force | Out-Null
+            @("updatelog.csv", "update_completed.txt", "update_started.txt") | ForEach-Object {
+                $p = "$remoteTempPath\$_"
+                if (Test-Path $p) { Move-Item $p "$archiveDir\$_" -Force }
+            }
+        }
+    }
+
+    # Clean up archives from previous days to prevent accumulation
+    Get-ChildItem "$remoteTempPath\archive_*" -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.CreationTime.Date -lt (Get-Date).Date } |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
     # Clear stale artifacts from any previous run to prevent false signals
-    @("updatelog.csv", "update_completed.txt") | ForEach-Object {
+    @("updatelog.csv", "update_completed.txt", "wujob_error.txt") | ForEach-Object {
         $p = "$remoteTempPath\$_"
         if (Test-Path $p) { Remove-Item $p -Force }
     }
+
+    # Remove any existing PSWindowsUpdate scheduled tasks from previous runs
+    # to prevent Invoke-WUJob from silently failing on conflict
+    try {
+        Get-ScheduledTask -TaskName "*PSWindowsUpdate*" -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                Stop-ScheduledTask -InputObject $_ -ErrorAction SilentlyContinue
+                Unregister-ScheduledTask -InputObject $_ -Confirm:$false -ErrorAction SilentlyContinue
+            }
+    } catch { }
+
     # Record job start time
     Get-Date | Out-File "$remoteTempPath\update_started.txt" -Force
     # Build the inner update scriptblock with the path baked in so the
@@ -593,8 +723,18 @@ $jobStartBlock = {
         }
         Get-Date | Out-File '$remoteTempPath\update_completed.txt' -Force
 "@)
-    Invoke-WUJob -RunNow -Confirm:$false -Verbose -Script $updateScript
+    try {
+        Invoke-WUJob -RunNow -Confirm:$false -Verbose -Script $updateScript
+    } catch {
+        # Surface the failure so Phase 1 and Phase 2 can detect it
+        "WUJOB_FAILED: $($_.Exception.Message)" | Out-File "$remoteTempPath\wujob_error.txt" -Force
+        throw
+    }
 }
+
+# Serialize $jobStartBlock as a string so it can cross the ForEach-Object -Parallel boundary.
+# PowerShell does not support passing scriptblocks via $using: in parallel loops.
+$jobStartBlockStr = $jobStartBlock.ToString()
 
 # Start updates on all computers in parallel — no throttle (each site is a separate network)
 $jobResults = $computers | ForEach-Object -Parallel {
@@ -602,6 +742,7 @@ $jobResults = $computers | ForEach-Object -Parallel {
     $IP            = $_.'IP'
     $cred          = $using:cred
     $rtPath        = $using:RemoteTempPath   # capture for use inside Invoke-Command
+    $jobBlock      = [scriptblock]::Create($using:jobStartBlockStr)
 
     # Pre-flight: quick TCP check on WinRM port before attempting full Invoke-Command.
     # Saves ~20s per offline machine (avoids the full WinRM connection timeout).
@@ -623,7 +764,7 @@ $jobResults = $computers | ForEach-Object -Parallel {
         Write-Host "[$site] Starting update job..." -ForegroundColor Yellow
 
         Invoke-Command -ComputerName $IP -Credential $cred -ErrorAction Stop `
-            -ArgumentList $rtPath -ScriptBlock ($using:jobStartBlock)
+            -ArgumentList $rtPath -ScriptBlock $jobBlock
 
         Write-Host "[$site] ✓ Update job started successfully" -ForegroundColor Green
         return [PSCustomObject]@{
@@ -642,7 +783,7 @@ $jobResults = $computers | ForEach-Object -Parallel {
             Error  = $_.Exception.Message
         }
     }
-} -ThrottleLimit $computers.Count
+} -ThrottleLimit ([math]::Min($ThrottleLimit, $computers.Count))
  
 # Save initial job status
 $jobResults | Export-CSV -Path "$sessionReportPath\job_start_status.csv" -NoTypeInformation
@@ -694,243 +835,396 @@ foreach ($f in ($jobResults | Where-Object { $_.Status -ne "Started" })) {
  
 Write-Host "`n╔══ Phase 3: Collecting Update Results ══╗" -ForegroundColor Cyan
 Write-Host ""
- 
+
 $allUpdateData = @()
 $computerSummary = @()
- 
+
+# ── Separate computers into collectable vs skip-early groups ──
+$skipComputers = @()
+$incompleteComputers = @()
+$collectableComputers = @()
+
 foreach ($computer in $computers) {
     $computerName = $computer.Name
-    $computerIP = $computer.IP
-    
-    Write-Host "[$computerName] " -NoNewline
-    
-    # Initialize summary for this computer
-    $summary = [PSCustomObject]@{
-        ComputerName = $computerName
-        IP = $computerIP
-        Status = $monitoringResults.Status[$computerName]
-        TotalUpdates = 0
-        Installed = 0
-        Failed = 0
-        Skipped = 0
-        InstalledWithErrors = 0
-        RebootRequired = $false
-        CollectionError = ""
+    $status = $monitoringResults.Status[$computerName]
+    if ($status -eq "JobStartFailed") {
+        $skipComputers += $computer
+    } elseif (-not $monitoringResults.Completed[$computerName]) {
+        $incompleteComputers += $computer
+    } else {
+        $collectableComputers += $computer
     }
-    
-    # Skip log collection for computers whose job never started (Phase 1 failure)
-    if ($summary.Status -eq "JobStartFailed") {
-        $phase1Error = ($jobResults | Where-Object { $_.Site -eq $computerName } | Select-Object -First 1).Error
-        $summary.CollectionError = if ($phase1Error) { "Job did not start: $phase1Error" } else { "Job did not start" }
-        Write-Host "JobStartFailed — $($summary.CollectionError)" -ForegroundColor DarkYellow
-        $computerSummary += $summary
-        continue
+}
+
+# Handle JobStartFailed computers immediately (no remote work needed)
+foreach ($computer in $skipComputers) {
+    $phase1Error = ($jobResults | Where-Object { $_.Site -eq $computer.Name } | Select-Object -First 1).Error
+    $errMsg = if ($phase1Error) { "Job did not start: $phase1Error" } else { "Job did not start" }
+    Write-Host "[$($computer.Name)] " -NoNewline
+    Write-Host "JobStartFailed — $errMsg" -ForegroundColor DarkYellow
+    $computerSummary += [PSCustomObject]@{
+        ComputerName = $computer.Name; IP = $computer.IP; Status = "JobStartFailed"
+        TotalUpdates = 0; Installed = 0; Failed = 0; Skipped = 0; InstalledWithErrors = 0
+        RebootRequired = $false; CollectionError = $errMsg; PreviousRunArchive = ""
+    }
+}
+
+# Handle incomplete computers immediately
+foreach ($computer in $incompleteComputers) {
+    Write-Host "[$($computer.Name)] " -NoNewline
+    Write-Host "Skipped (job did not complete)" -ForegroundColor Yellow
+    $computerSummary += [PSCustomObject]@{
+        ComputerName = $computer.Name; IP = $computer.IP; Status = "Incomplete"
+        TotalUpdates = 0; Installed = 0; Failed = 0; Skipped = 0; InstalledWithErrors = 0
+        RebootRequired = $false; CollectionError = ""; PreviousRunArchive = ""
+    }
+}
+
+if ($collectableComputers.Count -gt 0) {
+    # ── Step 1: Batch PSSession creation ──
+    $collectTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-Host "Creating sessions to $($collectableComputers.Count) computers... " -NoNewline
+
+    # Build IP→Name lookup since Invoke-Command returns PSComputerName (the IP)
+    $ipToName = @{}
+    $nameToIP = @{}
+    foreach ($c in $collectableComputers) { $ipToName[$c.IP] = $c.Name; $nameToIP[$c.Name] = $c.IP }
+
+    $allIPs = @($collectableComputers | ForEach-Object { $_.IP })
+    $sessions = @()
+    $sessionErrors = @{}
+    try {
+        $sessions = @(New-PSSession -ComputerName $allIPs -Credential $cred -ErrorAction SilentlyContinue -ErrorVariable sessionCreateErrors)
+    } catch { }
+
+    # Track which IPs failed to connect
+    $connectedIPs = @{}
+    foreach ($s in $sessions) { $connectedIPs[$s.ComputerName] = $true }
+    $failedIPs = $allIPs | Where-Object { -not $connectedIPs[$_] }
+
+    $failedCount = $failedIPs.Count
+    $connectedCount = $sessions.Count
+    Write-Host "✅ $connectedCount connected" -ForegroundColor Green -NoNewline
+    if ($failedCount -gt 0) {
+        Write-Host ", " -NoNewline
+        Write-Host "$failedCount failed" -ForegroundColor Red
+    } else {
+        Write-Host ""
     }
 
-    # Only collect if job completed
-    if ($monitoringResults.Completed[$computerName]) {
-        try {
-            # Use Copy-Item with PSSession to avoid double-hop authentication
-            $tempLocalFile = "$env:TEMP\updatelog_${computerName}_${timestamp}.csv"
+    # Add CollectionFailed summaries for machines we couldn't connect to
+    foreach ($failedIP in $failedIPs) {
+        $failedName = $ipToName[$failedIP]
+        $errDetail = ""
+        if ($sessionCreateErrors) {
+            $matchingErr = $sessionCreateErrors | Where-Object { $_.TargetObject -eq $failedIP -or "$_" -match [regex]::Escape($failedIP) } | Select-Object -First 1
+            if ($matchingErr) { $errDetail = $matchingErr.Exception.Message }
+        }
+        Write-Host "  [$failedName] " -NoNewline
+        Write-Host "Could not connect: $errDetail" -ForegroundColor Red
+        $computerSummary += [PSCustomObject]@{
+            ComputerName = $failedName; IP = $failedIP; Status = "CollectionFailed"
+            TotalUpdates = 0; Installed = 0; Failed = 0; Skipped = 0; InstalledWithErrors = 0
+            RebootRequired = $false; CollectionError = "Session creation failed: $errDetail"; PreviousRunArchive = ""
+        }
+    }
 
-            # Create PSSession with retry for transient network failures
-            $session = $null
-            for ($retryAttempt = 0; $retryAttempt -le $MaxRetries; $retryAttempt++) {
-                try {
-                    $session = New-PSSession -ComputerName $computerIP -Credential $cred -ErrorAction Stop
-                    break
-                } catch {
-                    if ($retryAttempt -lt $MaxRetries) {
-                        Start-Sleep -Seconds (5 * ($retryAttempt + 1))
-                    } else {
-                        throw
-                    }
-                }
+    # ── Step 2: Single batched Invoke-Command for ALL remote data ──
+    $remoteData = @{}
+    if ($sessions.Count -gt 0) {
+        Write-Host "Querying remote data (logs, hotfixes, reboot status)... " -NoNewline
+
+        $remoteResults = @(Invoke-Command -Session $sessions -ArgumentList $RemoteTempPath -ScriptBlock {
+            param($rtPath)
+            $data = @{
+                CsvContent       = $null
+                CsvExists        = $false
+                ArchiveCsvContent = $null
+                ArchiveName      = $null
+                CompletedMarker  = $false
+                Hotfixes         = @()
+                PendingKBs       = @()
+                RebootRequired   = $false
+                VerifyError      = $null
             }
 
+            # Read CSV content directly (eliminates file copy overhead)
+            $logPath = "$rtPath\updatelog.csv"
+            if (Test-Path $logPath) {
+                $data.CsvExists = $true
+                $data.CsvContent = Get-Content $logPath -Raw
+            }
+
+            # Check completion marker
+            $data.CompletedMarker = Test-Path "$rtPath\update_completed.txt"
+
+            # Check for same-day archive (previous run logs)
             try {
-                # Check if the update log exists on the remote machine
-                $remoteLogPath = "$RemoteTempPath\updatelog.csv"
-                $fileInfo = Invoke-Command -Session $session -ArgumentList $remoteLogPath -ScriptBlock {
-                    param($logPath)
-                    if (Test-Path $logPath) {
-                        $file = Get-Item $logPath
-                        @{ Exists = $true; Size = $file.Length; LastWriteTime = $file.LastWriteTime }
-                    } else {
-                        @{ Exists = $false }
+                $archive = Get-ChildItem "$rtPath\archive_*" -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $_.CreationTime.Date -eq (Get-Date).Date } |
+                    Sort-Object CreationTime -Descending | Select-Object -First 1
+                if ($archive -and (Test-Path "$($archive.FullName)\updatelog.csv")) {
+                    $data.ArchiveCsvContent = Get-Content "$($archive.FullName)\updatelog.csv" -Raw
+                    $data.ArchiveName = $archive.Name
+                }
+            } catch { }
+
+            # Verification: Get-HotFix (installed patches)
+            try {
+                $data.Hotfixes = @(Get-HotFix -ErrorAction Stop | ForEach-Object { $_.HotFixID })
+            } catch {
+                $data.VerifyError = "Get-HotFix: $($_.Exception.Message)"
+            }
+
+            # Verification: Pending updates (not yet installed)
+            try {
+                $searcher = New-Object -ComObject Microsoft.Update.Searcher
+                $searchResult = $searcher.Search("IsInstalled=0")
+                $data.PendingKBs = @($searchResult.Updates | ForEach-Object {
+                    @($_.KBArticleIDs) | ForEach-Object { "KB$_" }
+                })
+            } catch { }
+
+            # Reboot status from registry
+            if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") {
+                $data.RebootRequired = $true
+            } elseif (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") {
+                $data.RebootRequired = $true
+            } else {
+                $pfro = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+                if ($pfro.PendingFileRenameOperations) { $data.RebootRequired = $true }
+            }
+
+            return $data
+        } -ErrorAction SilentlyContinue -ErrorVariable remoteQueryErrors)
+
+        # Index results by IP (PSComputerName)
+        foreach ($r in $remoteResults) {
+            $remoteData[$r.PSComputerName] = $r
+        }
+
+        $collectTimer.Stop()
+        Write-Host "✅ Done ($([math]::Round($collectTimer.Elapsed.TotalSeconds, 1))s)" -ForegroundColor Green
+
+        # Clean up all sessions in batch
+        $sessions | Remove-PSSession -ErrorAction SilentlyContinue
+    }
+
+    # ── Step 3: Process results locally (fast — no network calls) ──
+    Write-Host "Processing results..."
+
+    foreach ($computer in $collectableComputers) {
+        $computerName = $computer.Name
+        $computerIP = $computer.IP
+
+        # Skip if already handled as connection failure
+        if ($failedIPs -contains $computerIP) { continue }
+
+        # Initialize summary
+        $summary = [PSCustomObject]@{
+            ComputerName = $computerName; IP = $computerIP
+            Status = $monitoringResults.Status[$computerName]
+            TotalUpdates = 0; Installed = 0; Failed = 0; Skipped = 0; InstalledWithErrors = 0
+            RebootRequired = $false; CollectionError = ""; PreviousRunArchive = ""
+        }
+
+        $result = $remoteData[$computerIP]
+        if (-not $result) {
+            # Remote query returned no data for this machine
+            Write-Host "  [$computerName] " -NoNewline
+            Write-Host "No data returned from remote query" -ForegroundColor Yellow
+            $summary.Status = "CollectionFailed"
+            $summary.CollectionError = "Invoke-Command returned no data"
+            $computerSummary += $summary
+            continue
+        }
+
+        Write-Host "  [$computerName] " -NoNewline
+
+        try {
+            if ($result.CsvExists -and $result.CsvContent) {
+                # Parse CSV from string content (no file copy needed)
+                $updates = @($result.CsvContent | ConvertFrom-Csv -ErrorAction Stop)
+
+                # Save archive CSV locally if present (for diff reports)
+                if ($result.ArchiveCsvContent) {
+                    $prevLocalFile = "$sessionReportPath\previous_updatelog_${computerName}.csv"
+                    $result.ArchiveCsvContent | Set-Content -Path $prevLocalFile -Encoding UTF8 -ErrorAction SilentlyContinue
+                    $summary.PreviousRunArchive = $result.ArchiveName
+                }
+
+                # Validate CSV schema
+                if ($updates.Count -gt 0) {
+                    $csvCols = $updates[0].PSObject.Properties.Name
+                    $expectedCols = @('KB', 'Title', 'Result', 'Status')
+                    $missingCols = $expectedCols | Where-Object { $csvCols -notcontains $_ }
+                    if ($missingCols.Count -gt 0) {
+                        Write-Host "Warning: CSV missing columns: $($missingCols -join ', ') " -ForegroundColor Yellow -NoNewline
+                        $summary.CollectionError = "CSV schema: missing $($missingCols -join ', ')"
                     }
                 }
 
-                if ($fileInfo.Exists) {
-                    # Copy the file to local machine
-                    Copy-Item -FromSession $session -Path $remoteLogPath -Destination $tempLocalFile -Force -ErrorAction Stop
-                    
-                    # Now read the local copy
-                    $updates = Import-Csv $tempLocalFile -ErrorAction Stop
-                    
-                    # Check reboot status
-                    $rebootStatus = $true
-                    
-                    # Process the updates with comprehensive parsing
-                    if ($updates.Count -gt 0) {
-                        # Deduplicate: PSWindowsUpdate may log multiple rows per update
-                        $seenUpdates = @{}
-
-                        foreach ($update in $updates) {
-                            # Get values as strings for comparison
-                            $resultValue = if ($update.Result) { $update.Result.ToString().Trim() } else { "" }
-                            $statusValue = if ($update.Status) { $update.Status.ToString().Trim() } else { "" }
-
-                            # Skip duplicates (same KB or Title for this computer)
-                            $dedupKey = if ($update.KB -and $update.KB -ne '') { $update.KB } else { $update.Title }
-                            if ($seenUpdates.ContainsKey($dedupKey)) { continue }
-                            $seenUpdates[$dedupKey] = $true
-                            
-                            # Determine actual status
-                            $actualStatus = "Unknown"
-                            $isFailure = $false
-                            $isSuccess = $false
-                            $isDefenderDefinition = $update.Title -match 'Security Intelligence Update for Microsoft Defender'
-
-                            # Defender definition updates self-install via MpSigStub before WU can;
-                            # WU reports failure/abort but the definitions are current. Mark as Skipped.
-                            if ($isDefenderDefinition -and ($resultValue -match '^Fail|^Abort' -or
-                                $resultValue -eq '4' -or $resultValue -eq '5')) {
-                                $summary.Skipped++
-                                $actualStatus = "Skipped"
-                            }
-                            # Check Result field for text values
-                            elseif ($resultValue -eq "Failed" -or $resultValue -match "^Fail") {
-                                $summary.Failed++
-                                $actualStatus = "Failed"
-                                $isFailure = $true
-                            }
-                            elseif ($resultValue -eq "Installed" -or $resultValue -match "^Install|^Success") {
-                                $summary.Installed++
-                                $actualStatus = "Installed"
-                                $isSuccess = $true
-                            }
-                            elseif ($resultValue -match "Abort") {
-                                $summary.Failed++
-                                $actualStatus = "Aborted"
-                                $isFailure = $true
-                            }
-                            elseif ($resultValue -match "Error") {
-                                $summary.InstalledWithErrors++
-                                $actualStatus = "InstalledWithErrors"
-                            }
-                            # Check numeric codes
-                            elseif ($resultValue -eq "2" -or $resultValue -eq 2) {
-                                $summary.Installed++
-                                $actualStatus = "Installed"
-                                $isSuccess = $true
-                            }
-                            elseif ($resultValue -eq "3" -or $resultValue -eq 3) {
-                                $summary.InstalledWithErrors++
-                                $actualStatus = "InstalledWithErrors"
-                            }
-                            elseif ($resultValue -eq "4" -or $resultValue -eq 4) {
-                                $summary.Failed++
-                                $actualStatus = "Failed"
-                                $isFailure = $true
-                            }
-                            elseif ($resultValue -eq "5" -or $resultValue -eq 5) {
-                                $summary.Failed++
-                                $actualStatus = "Aborted"
-                                $isFailure = $true
-                            }
-                            # If still unknown, check Status field
-                            elseif ($statusValue -match "Fail") {
-                                $summary.Failed++
-                                $actualStatus = "Failed"
-                                $isFailure = $true
-                            }
-                            elseif ($statusValue -match "Install|Success") {
-                                $summary.Installed++
-                                $actualStatus = "Installed"
-                                $isSuccess = $true
-                            }
-                            
-                            # Special case: Status is "Unknown" but Result is "Failed"
-                            if ($statusValue -eq "Unknown" -and $resultValue -eq "Failed" -and !$isFailure) {
-                                $summary.Failed++
-                                $actualStatus = "Failed"
-                                $isFailure = $true
-                            }
-                            
-                            $allUpdateData += [PSCustomObject]@{
-                                ComputerName = $computerName
-                                ComputerIP = $computerIP
-                                KB = $update.KB
-                                Title = $update.Title
-                                Size = $update.Size
-                                Result = $resultValue
-                                Status = $actualStatus
-                                OriginalStatus = $statusValue
-                                ComputerNameClean = $computerName -replace '[^a-zA-Z0-9]', '_'
-                                IsFailure = $isFailure
-                            }
-                        }
- 
-                        # Total updates count (deduplicated)
-                        $summary.TotalUpdates = $seenUpdates.Count
-                        $summary.RebootRequired = $rebootStatus
-                        
-                        Write-Host "Collected $($summary.TotalUpdates) updates " -NoNewline
-                        if ($summary.Installed -gt 0) {
-                            Write-Host "(✅ $($summary.Installed) installed" -NoNewline -ForegroundColor Green
-                        }
-                        if ($summary.Failed -gt 0) {
-                            if ($summary.Installed -gt 0) {
-                                Write-Host ", " -NoNewline
-                            } else {
-                                Write-Host "(" -NoNewline
-                            }
-                            Write-Host "❌ $($summary.Failed) failed" -NoNewline -ForegroundColor Red
-                        }
-                        Write-Host ")" -ForegroundColor Green
-                        
-                    } else {
-                        Write-Host "CSV is empty - no updates were needed" -ForegroundColor Green
-                        $summary.Status = "NoUpdatesNeeded"
+                # Build verification lookup tables
+                $installedKBs = @{}
+                $pendingKBs = @{}
+                $hasVerification = $false
+                if ($result.Hotfixes -or $result.PendingKBs) {
+                    $hasVerification = $true
+                    foreach ($hf in $result.Hotfixes) {
+                        if ($hf) { $installedKBs[$hf] = $true }
                     }
- 
-                    # (No updates are filtered out here; filtering is handled client-side in the HTML report)
-                    
-                    # Clean up local temp file
-                    Remove-Item $tempLocalFile -Force -ErrorAction SilentlyContinue
+                    foreach ($kb in $result.PendingKBs) {
+                        $pendingKBs[$kb] = $true
+                    }
+                }
+
+                $rebootStatus = if ($null -ne $result.RebootRequired) { $result.RebootRequired } else { $false }
+
+                # Process updates with comprehensive parsing
+                if ($updates.Count -gt 0) {
+                    $seenUpdates = @{}
+
+                    foreach ($update in $updates) {
+                        $resultValue = if ($update.Result) { $update.Result.ToString().Trim() } else { "" }
+                        $statusValue = if ($update.Status) { $update.Status.ToString().Trim() } else { "" }
+
+                        # Skip duplicates
+                        $dedupKey = if ($update.KB -and $update.KB -ne '') { $update.KB } else { $update.Title }
+                        if ($seenUpdates.ContainsKey($dedupKey)) { continue }
+                        $seenUpdates[$dedupKey] = $true
+
+                        $actualStatus = "Unknown"
+                        $isFailure = $false
+                        $isSuccess = $false
+                        $isDefenderDefinition = $update.Title -match 'Security Intelligence Update for Microsoft Defender'
+
+                        # Defender definition updates self-install via MpSigStub before WU can;
+                        # WU reports failure/abort but the definitions are current. Mark as Skipped.
+                        if ($isDefenderDefinition -and ($resultValue -match '^Fail|^Abort' -or
+                            $resultValue -eq '4' -or $resultValue -eq '5')) {
+                            $summary.Skipped++
+                            $actualStatus = "Skipped"
+                        }
+                        elseif ($resultValue -eq "Failed" -or $resultValue -match "^Fail") {
+                            $summary.Failed++; $actualStatus = "Failed"; $isFailure = $true
+                        }
+                        elseif ($resultValue -eq "Installed" -or $resultValue -match "^Install|^Success") {
+                            $summary.Installed++; $actualStatus = "Installed"; $isSuccess = $true
+                        }
+                        elseif ($resultValue -match "Abort") {
+                            $summary.Failed++; $actualStatus = "Aborted"; $isFailure = $true
+                        }
+                        elseif ($resultValue -match "Error") {
+                            $summary.InstalledWithErrors++; $actualStatus = "InstalledWithErrors"
+                        }
+                        elseif ($resultValue -eq "2" -or $resultValue -eq 2) {
+                            $summary.Installed++; $actualStatus = "Installed"; $isSuccess = $true
+                        }
+                        elseif ($resultValue -eq "3" -or $resultValue -eq 3) {
+                            $summary.InstalledWithErrors++; $actualStatus = "InstalledWithErrors"
+                        }
+                        elseif ($resultValue -eq "4" -or $resultValue -eq 4) {
+                            $summary.Failed++; $actualStatus = "Failed"; $isFailure = $true
+                        }
+                        elseif ($resultValue -eq "5" -or $resultValue -eq 5) {
+                            $summary.Failed++; $actualStatus = "Aborted"; $isFailure = $true
+                        }
+                        elseif ($statusValue -match "Fail") {
+                            $summary.Failed++; $actualStatus = "Failed"; $isFailure = $true
+                        }
+                        elseif ($statusValue -match "Install|Success") {
+                            $summary.Installed++; $actualStatus = "Installed"; $isSuccess = $true
+                        }
+
+                        # Special case: Status is "Unknown" but Result is "Failed"
+                        if ($statusValue -eq "Unknown" -and $resultValue -eq "Failed" -and !$isFailure) {
+                            $summary.Failed++; $actualStatus = "Failed"; $isFailure = $true
+                        }
+
+                        # ── Verification: cross-reference KB against actual OS state ──
+                        $verified = "N/A"
+                        if ($update.KB -and $update.KB -ne '' -and $update.KB -ne 'N/A') {
+                            if ($installedKBs.ContainsKey($update.KB)) {
+                                $verified = "Yes"
+                            } elseif ($pendingKBs.ContainsKey($update.KB)) {
+                                $verified = "No"
+                            } elseif ($hasVerification) {
+                                $verified = "Pending"
+                            }
+                        }
+
+                        # Auto-correct: if PSWindowsUpdate said "Failed" but OS confirms installed
+                        if ($isFailure -and $verified -eq "Yes" -and -not $isDefenderDefinition) {
+                            $summary.Failed--
+                            $summary.Installed++
+                            $actualStatus = "Installed"
+                            $isFailure = $false
+                            $isSuccess = $true
+                        }
+
+                        $allUpdateData += [PSCustomObject]@{
+                            ComputerName = $computerName
+                            ComputerIP = $computerIP
+                            KB = $update.KB
+                            Title = $update.Title
+                            Size = $update.Size
+                            Result = $resultValue
+                            Status = $actualStatus
+                            OriginalStatus = $statusValue
+                            ComputerNameClean = $computerName -replace '[^a-zA-Z0-9]', '_'
+                            IsFailure = $isFailure
+                            Verified = $verified
+                        }
+                    }
+
+                    $summary.TotalUpdates = $seenUpdates.Count
+                    $summary.RebootRequired = $rebootStatus
+
+                    Write-Host "$($summary.TotalUpdates) updates " -NoNewline
+                    if ($summary.Installed -gt 0) {
+                        Write-Host "(✅ $($summary.Installed) installed" -NoNewline -ForegroundColor Green
+                    }
+                    if ($summary.Failed -gt 0) {
+                        if ($summary.Installed -gt 0) { Write-Host ", " -NoNewline } else { Write-Host "(" -NoNewline }
+                        Write-Host "❌ $($summary.Failed) failed" -NoNewline -ForegroundColor Red
+                    }
+                    Write-Host ")" -ForegroundColor Green
 
                 } else {
-                    Write-Host "Update log not found on remote" -ForegroundColor Yellow
-                    $summary.Status = "NoLogFile"
+                    # CSV exists but is empty
+                    if ($result.CompletedMarker) {
+                        Write-Host "No updates needed" -ForegroundColor Green
+                        $summary.Status = "NoUpdatesNeeded"
+                    } else {
+                        Write-Host "CSV empty, completion marker missing - inconclusive" -ForegroundColor Yellow
+                        $summary.Status = "Inconclusive"
+                    }
                 }
 
-            } catch {
-                Write-Host "Failed to collect: $($_.Exception.Message)" -ForegroundColor Red
-                $summary.Status = "CollectionFailed"
-                $summary.CollectionError = $_.Exception.Message
-            } finally {
-                # Always close the session, even when an error occurs
-                if ($session) { Remove-PSSession $session -ErrorAction SilentlyContinue }
+            } elseif (-not $result.CsvExists) {
+                Write-Host "Update log not found on remote" -ForegroundColor Yellow
+                $summary.Status = "NoLogFile"
+            } else {
+                Write-Host "CSV exists but content was empty" -ForegroundColor Yellow
+                if ($result.CompletedMarker) {
+                    $summary.Status = "NoUpdatesNeeded"
+                } else {
+                    $summary.Status = "Inconclusive"
+                }
             }
-
         } catch {
-            # Catches PSSession creation failures after all retries exhausted
-            Write-Host "Could not connect to collect results: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "Processing error: $($_.Exception.Message)" -ForegroundColor Red
             $summary.Status = "CollectionFailed"
             $summary.CollectionError = $_.Exception.Message
         }
-    } else {
-        Write-Host "Skipped (job did not complete)" -ForegroundColor Yellow
-        $summary.Status = "Incomplete"
+
+        # Finalize status
+        if ($summary.TotalUpdates -gt 0 -and $summary.Status -ne "CollectionFailed") {
+            $summary.Status = "Completed"
+        }
+
+        $computerSummary += $summary
     }
-    
-    # Update the Status to "Completed" if we successfully collected data
-    if ($summary.TotalUpdates -gt 0 -and $summary.Status -ne "CollectionFailed") {
-        $summary.Status = "Completed"
-    }
-    
-    $computerSummary += $summary
 }
  
 # Save collected data
@@ -942,7 +1236,7 @@ if ($allUpdateData.Count -gt 0) {
 # Re-run CSV: computers that need another pass (real failures or did not complete)
 $rerunList = $computerSummary | Where-Object {
     $_.Failed -gt 0 -or
-    $_.Status -in @('Incomplete', 'CollectionFailed', 'Unreachable', 'Ignored-WSMAN', 'JobStartFailed')
+    $_.Status -in @('Incomplete', 'CollectionFailed', 'Unreachable', 'Ignored-WSMAN', 'JobStartFailed', 'Inconclusive')
 }
 if ($rerunList) {
     $rerunCsvPath = Join-Path $sessionReportPath "rerun_computers.csv"
@@ -972,8 +1266,32 @@ $totalCompleted = ($computerSummary | Where-Object { $_.Status -eq "Completed" }
 $totalUpdates = ($computerSummary | Measure-Object -Property TotalUpdates -Sum).Sum
 $totalInstalled = ($computerSummary | Measure-Object -Property Installed -Sum).Sum
 $totalFailed = ($computerSummary | Measure-Object -Property Failed -Sum).Sum
-$computersNeedReboot = ($computerSummary | Where-Object { $_.RebootRequired }).Count
- 
+$computersNeedReboot = ($computerSummary | Where-Object { $_.RebootRequired -eq $true -or $_.RebootRequired -eq "True" }).Count
+
+# Verification statistics
+$verifiedCount = ($allUpdateData | Where-Object { $_.Verified -eq 'Yes' }).Count
+$verifiableCount = ($allUpdateData | Where-Object { $_.Verified -ne 'N/A' -and $_.Verified -ne '' }).Count
+$discrepancies = @($allUpdateData | Where-Object {
+    ($_.Status -eq 'Installed' -and $_.Verified -eq 'No') -or
+    ($_.Status -in @('Failed', 'Aborted') -and $_.Verified -eq 'Yes')
+})
+$discrepancyComputers = @($discrepancies | Select-Object -ExpandProperty ComputerName -Unique)
+
+# Load previous run data for rerun diff (keyed by computer name)
+$previousRunData = @{}
+foreach ($cs in $computerSummary) {
+    if ($cs.PreviousRunArchive -and $cs.PreviousRunArchive -ne '') {
+        $prevFile = "$sessionReportPath\previous_updatelog_$($cs.ComputerName).csv"
+        if (Test-Path $prevFile) {
+            try {
+                $prevUpdates = Import-Csv $prevFile -ErrorAction Stop
+                $previousRunData[$cs.ComputerName] = $prevUpdates
+            } catch { }
+        }
+    }
+}
+$rerunComputers = @($computerSummary | Where-Object { $_.PreviousRunArchive -ne '' })
+
 # Get computers with failures for the alert section
 $computersWithFailures = $computerSummary | Where-Object { $_.Failed -gt 0 } | Sort-Object Failed -Descending
  
@@ -1052,6 +1370,7 @@ $html = @"
         .stat-item.red .stat-value { color: #dc2626; }
         .stat-item.amber .stat-value { color: #d97706; }
         .stat-item.purple .stat-value { color: #7c3aed; }
+        .stat-item.gray .stat-value { color: #94a3b8; }
         /* Alert banners */
         .alert-banner {
             margin: 12px 16px 0; border-radius: 10px; overflow: hidden;
@@ -1220,6 +1539,7 @@ $html = @"
         <div class="stat-item red"><div class="stat-value" id="stat-failed-value">$totalFailed</div><div class="stat-label">Failed</div></div>
         <div class="stat-item amber"><div class="stat-value">$computersNeedReboot</div><div class="stat-label">Need Reboot</div></div>
         <div class="stat-item purple"><div class="stat-value" id="stat-total-value">$totalUpdates</div><div class="stat-label">Total Updates</div></div>
+        <div class="stat-item $(if ($verifiableCount -gt 0 -and $verifiedCount -eq $verifiableCount) {'green'} elseif ($verifiedCount -gt 0) {'blue'} else {'gray'})"><div class="stat-value">$verifiedCount / $verifiableCount</div><div class="stat-label">Verified</div></div>
     </div>
 "@
 
@@ -1267,6 +1587,29 @@ if ($computersWithConnectionFailures.Count -gt 0) {
             default            { $cc.Status }
         }
         $html += "            <span class=`"alert-chip conn`" onclick=`"scrollToComputer('$cn')`">$safeName &mdash; $statusReason</span>`n"
+    }
+    $html += @"
+        </div>
+    </div>
+"@
+}
+
+# Verification discrepancy banner
+if ($discrepancies.Count -gt 0) {
+    $html += @"
+    <div class="alert-banner connection" style="background:#fefce8;border-color:#fde047;">
+        <div class="alert-header" style="color:#854d0e;" onclick="toggleAlert(this)">
+            <span>&#128269;</span>
+            <span>$($discrepancies.Count) update$(if($discrepancies.Count -ne 1){'s'}) with verification discrepancies</span>
+            <span class="toggle-icon">&#9660;</span>
+        </div>
+        <div class="alert-body" style="font-size:0.85em;color:#854d0e;">
+"@
+    foreach ($dc in $discrepancyComputers) {
+        $cn = $dc -replace '[^a-zA-Z0-9]', '_'
+        $safeName = ConvertTo-HtmlEncoded $dc
+        $dcCount = ($discrepancies | Where-Object { $_.ComputerName -eq $dc }).Count
+        $html += "            <span class=`"alert-chip`" style=`"background:#fef9c3;border-color:#facc15;color:#854d0e;`" onclick=`"scrollToComputer('$cn')`">$safeName <span class=`"chip-count`" style=`"background:#eab308;`">$dcCount</span></span>`n"
     }
     $html += @"
         </div>
@@ -1358,12 +1701,13 @@ foreach ($summary in $computerSummary | Sort-Object @{Expression={if([int]$_.Fai
     $cleanName = $computerName -replace '[^a-zA-Z0-9]', '_'
     $safeComputerName = ConvertTo-HtmlEncoded $computerName
     $hasFailures = [int]$summary.Failed -gt 0
-    $isUnreachable = $summary.Status -in @("Ignored-WSMAN", "Incomplete", "CollectionFailed", "JobStartFailed")
+    $isUnreachable = $summary.Status -in @("Ignored-WSMAN", "Incomplete", "CollectionFailed", "JobStartFailed", "Inconclusive")
 
     $statusBadge = switch ($summary.Status) {
         "Completed"        { '<span class="badge-sm status-ok">Completed</span>' }
         "NoUpdatesNeeded"  { '<span class="badge-sm status-skip">Up to Date</span>' }
         "Incomplete"       { '<span class="badge-sm status-warn">Incomplete</span>' }
+        "Inconclusive"     { '<span class="badge-sm status-warn">Inconclusive</span>' }
         "Ignored-WSMAN"    { '<span class="badge-sm status-fail">Unreachable</span>' }
         "CollectionFailed" { '<span class="badge-sm status-fail">Collection Failed</span>' }
         "JobStartFailed"   { '<span class="badge-sm status-fail">Job Failed</span>' }
@@ -1378,6 +1722,10 @@ foreach ($summary in $computerSummary | Sort-Object @{Expression={if([int]$_.Fai
         '<span class="badge-sm reboot">Yes</span>'
     } else { "" }
 
+    $rerunBadge = if ($summary.PreviousRunArchive -and $summary.PreviousRunArchive -ne '') {
+        ' <span class="badge-sm" style="background:#e0e7ff;color:#4338ca;font-size:0.7em;">Rerun</span>'
+    } else { "" }
+
     $installedCount = if ([int]$summary.Installed -gt 0) { $summary.Installed } else { "-" }
     $failedCount = if ([int]$summary.Failed -gt 0) { $summary.Failed } else { "-" }
     $skippedCount = if ([int]$summary.Skipped -gt 0) { $summary.Skipped } else { "-" }
@@ -1387,7 +1735,7 @@ foreach ($summary in $computerSummary | Sort-Object @{Expression={if([int]$_.Fai
                     <tr class="$rowClass" data-computer="$computerName" data-status="$($summary.Status)" id="computer-$cleanName" onclick="toggleComputer('$cleanName')">
                         <td><span class="expand-chevron">&#9654;</span></td>
                         <td>$statusBadge</td>
-                        <td class="computer-name-cell" title="$safeComputerName">$safeComputerName</td>
+                        <td class="computer-name-cell" title="$safeComputerName">$safeComputerName$rerunBadge</td>
                         <td class="ip-cell">$(ConvertTo-HtmlEncoded $summary.IP)</td>
                         <td class="count-cell installed">$installedCount</td>
                         <td class="count-cell failed">$failedCount</td>
@@ -1408,11 +1756,12 @@ foreach ($summary in $computerSummary | Sort-Object @{Expression={if([int]$_.Fai
         $html += @"
                                 <table class="update-table">
                                     <thead><tr>
-                                        <th style="width:12%">KB</th>
-                                        <th style="width:52%">Update Title</th>
+                                        <th style="width:10%">KB</th>
+                                        <th style="width:44%">Update Title</th>
                                         <th style="width:8%">Size</th>
                                         <th style="width:14%">Status</th>
-                                        <th style="width:14%">Result</th>
+                                        <th style="width:12%">Result</th>
+                                        <th style="width:12%">Verified</th>
                                     </tr></thead>
                                     <tbody>
 "@
@@ -1439,6 +1788,14 @@ foreach ($summary in $computerSummary | Sort-Object @{Expression={if([int]$_.Fai
             $uKey = if ($update.KB -and $update.KB -ne '') { $update.KB } else { $update.Title -replace '\s+', '_' -replace '[^A-Za-z0-9_\-]', '' }
             $safeTitle = ConvertTo-HtmlEncoded $update.Title
 
+            $verifiedVal = if ($update.Verified) { $update.Verified.ToString() } else { "N/A" }
+            $verifiedDisplay = switch ($verifiedVal) {
+                "Yes"     { '<span style="color:#16a34a;" title="Confirmed installed via Get-HotFix">&#10003; Yes</span>' }
+                "No"      { '<span style="color:#dc2626;" title="Still listed as needed by Windows Update">&#10007; No</span>' }
+                "Pending" { '<span style="color:#d97706;" title="Not in hotfix list yet — may need reboot">&#8987; Pending</span>' }
+                default   { '<span style="color:#94a3b8;" title="No KB to verify (driver/other)">&mdash;</span>' }
+            }
+
             $html += @"
                                         <tr$rowClass data-ukey='$uKey'>
                                             <td>$kbDisplay</td>
@@ -1446,6 +1803,7 @@ foreach ($summary in $computerSummary | Sort-Object @{Expression={if([int]$_.Fai
                                             <td>$($update.Size)</td>
                                             <td>$statusDisplay</td>
                                             <td style="text-align:center;color:$(if($isFailedRow){'#ef4444'}else{'#64748b'});">$resultText</td>
+                                            <td style="text-align:center;">$verifiedDisplay</td>
                                         </tr>
 "@
         }
@@ -1461,6 +1819,49 @@ foreach ($summary in $computerSummary | Sort-Object @{Expression={if([int]$_.Fai
         $html += "                                <div class=`"no-data`" style=`"color:#dc2626;`">Error: $safeError</div>`n"
     } else {
         $html += "                                <div class=`"no-data`">No update data available</div>`n"
+    }
+
+    # Previous run diff section (for same-day reruns)
+    if ($previousRunData.ContainsKey($computerName)) {
+        $prevUpdates = $previousRunData[$computerName]
+        $prevKBs = @{}
+        foreach ($pu in $prevUpdates) {
+            $pk = if ($pu.KB -and $pu.KB -ne '') { $pu.KB } else { $pu.Title }
+            $prevKBs[$pk] = $pu
+        }
+        # Find new updates in this run that weren't in the previous run
+        $newInThisRun = @($computerData | Where-Object {
+            $k = if ($_.KB -and $_.KB -ne '') { $_.KB } else { $_.Title }
+            -not $prevKBs.ContainsKey($k)
+        })
+        $newBadge = if ($newInThisRun.Count -gt 0) { " &mdash; <strong>$($newInThisRun.Count) new</strong>" } else { "" }
+
+        $html += @"
+                                <details class="prev-run-details" style="margin-top:12px;">
+                                    <summary style="cursor:pointer;font-size:0.85em;color:#6366f1;font-weight:600;">&#128337; Previous Run ($($summary.PreviousRunArchive -replace 'archive_',''))$newBadge</summary>
+                                    <table class="update-table" style="margin-top:6px;opacity:0.75;">
+                                        <thead><tr>
+                                            <th style="width:12%">KB</th>
+                                            <th style="width:52%">Update Title</th>
+                                            <th style="width:18%">Status</th>
+                                            <th style="width:18%">Result</th>
+                                        </tr></thead>
+                                        <tbody>
+"@
+        foreach ($pu in $prevUpdates) {
+            $puKb = if ($pu.KB -and $pu.KB -ne 'N/A' -and $pu.KB -ne '') {
+                "<span class='kb-badge'>$(ConvertTo-HtmlEncoded $pu.KB)</span>"
+            } else { "<span style='color:#94a3b8;'>-</span>" }
+            $puTitle = ConvertTo-HtmlEncoded $pu.Title
+            $puResult = if ($pu.Result) { ConvertTo-HtmlEncoded $pu.Result.ToString() } else { "" }
+            $puStatus = if ($pu.Status) { ConvertTo-HtmlEncoded $pu.Status.ToString() } else { "" }
+            $html += "                                            <tr><td>$puKb</td><td>$puTitle</td><td>$puStatus</td><td>$puResult</td></tr>`n"
+        }
+        $html += @"
+                                        </tbody>
+                                    </table>
+                                </details>
+"@
     }
 
     $html += @"
