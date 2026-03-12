@@ -11,6 +11,8 @@ Parallel Windows Update deployment tool for rolling out updates to remote comput
 - **Stuck-job detection** — Re-triggers jobs on machines stuck in "Waiting to start" after a configurable timeout
 - **WUJob error surfacing** — Detects and reports silent `Invoke-WUJob` failures via marker files
 - **Session-aware** — Ignores stale artifacts from previous runs using timestamp-based validation
+- **Rerun-safe** — Cleans up existing PSWindowsUpdate scheduled tasks before starting new jobs; archives same-day logs for diff comparison
+- **Log preservation** — When rerunning on the same day, previous run logs are archived (not deleted) and a diff is shown in the HTML report
 - **Post-install verification** — Cross-references PSWindowsUpdate results against `Get-HotFix` and Windows Update API to confirm updates actually installed
 - **Auto-correction** — Reclassifies false failures when verification proves an update installed successfully
 - **Accurate reboot detection** — Checks actual registry reboot-pending keys instead of assuming all machines need reboot
@@ -187,3 +189,6 @@ The script doesn't just trust PSWindowsUpdate's output. After collecting results
 | Double-hop auth failures | Script uses `Copy-Item -FromSession` to avoid double-hop issues |
 | Status shows "Inconclusive" | Empty update log without completion marker — job may have crashed; re-run |
 | Verified shows "Pending" | Update installed but not yet in hotfix list — machine needs reboot |
+| Second run shows stale results | Fixed — script now removes existing PSWindowsUpdate scheduled tasks before starting new jobs |
+| "Rerun" badge on computers | Previous run logs were archived; expand the detail row to see the diff |
+| Old archives on remote machines | Archives from previous days are automatically cleaned up; same-day archives are preserved |

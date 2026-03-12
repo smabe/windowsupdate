@@ -100,6 +100,13 @@ if ($ReportOnly) {
         }
     }
 
+    # Ensure PreviousRunArchive field exists on summary objects (old CSVs may lack it)
+    $computerSummary | ForEach-Object {
+        if (-not ($_.PSObject.Properties.Name -contains 'PreviousRunArchive')) {
+            $_ | Add-Member -NotePropertyName PreviousRunArchive -NotePropertyValue '' -Force
+        }
+    }
+
     # Recalculate per-computer summary counts from deduplicated data
     $updatesByComputer = $allUpdateData | Group-Object ComputerName
     foreach ($summary in $computerSummary) {
@@ -645,19 +652,50 @@ if (-not $credValid) {
 }
 
 # Job-start scriptblock — shared by Phase 1 and the late-arrival retry logic.
-# Passed via $using:jobStartBlock in the parallel loop, and as -JobStartScript to
-# Wait-ForUpdateJobs for late-arrival retries.
+# Serialized as a string for Phase 1 (ForEach-Object -Parallel cannot pass scriptblocks
+# via $using:), and passed directly as -JobStartScript to Wait-ForUpdateJobs.
 $jobStartBlock = {
     param($remoteTempPath)
     # Ensure temp directory exists
     if (-not (Test-Path $remoteTempPath)) {
         New-Item $remoteTempPath -ItemType Directory -Force | Out-Null
     }
+
+    # Archive previous run's artifacts if they exist and are from today (preserve for diff)
+    $logPath = "$remoteTempPath\updatelog.csv"
+    if (Test-Path $logPath) {
+        $logTime = (Get-Item $logPath).LastWriteTime
+        if ($logTime.Date -eq (Get-Date).Date) {
+            $archiveDir = "$remoteTempPath\archive_$($logTime.ToString('HHmmss'))"
+            New-Item $archiveDir -ItemType Directory -Force | Out-Null
+            @("updatelog.csv", "update_completed.txt", "update_started.txt") | ForEach-Object {
+                $p = "$remoteTempPath\$_"
+                if (Test-Path $p) { Move-Item $p "$archiveDir\$_" -Force }
+            }
+        }
+    }
+
+    # Clean up archives from previous days to prevent accumulation
+    Get-ChildItem "$remoteTempPath\archive_*" -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.CreationTime.Date -lt (Get-Date).Date } |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
     # Clear stale artifacts from any previous run to prevent false signals
     @("updatelog.csv", "update_completed.txt", "wujob_error.txt") | ForEach-Object {
         $p = "$remoteTempPath\$_"
         if (Test-Path $p) { Remove-Item $p -Force }
     }
+
+    # Remove any existing PSWindowsUpdate scheduled tasks from previous runs
+    # to prevent Invoke-WUJob from silently failing on conflict
+    try {
+        Get-ScheduledTask -TaskName "*PSWindowsUpdate*" -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                Stop-ScheduledTask -InputObject $_ -ErrorAction SilentlyContinue
+                Unregister-ScheduledTask -InputObject $_ -Confirm:$false -ErrorAction SilentlyContinue
+            }
+    } catch { }
+
     # Record job start time
     Get-Date | Out-File "$remoteTempPath\update_started.txt" -Force
     # Build the inner update scriptblock with the path baked in so the
@@ -681,12 +719,17 @@ $jobStartBlock = {
     }
 }
 
+# Serialize $jobStartBlock as a string so it can cross the ForEach-Object -Parallel boundary.
+# PowerShell does not support passing scriptblocks via $using: in parallel loops.
+$jobStartBlockStr = $jobStartBlock.ToString()
+
 # Start updates on all computers in parallel — no throttle (each site is a separate network)
 $jobResults = $computers | ForEach-Object -Parallel {
     $site          = $_.'Name'
     $IP            = $_.'IP'
     $cred          = $using:cred
     $rtPath        = $using:RemoteTempPath   # capture for use inside Invoke-Command
+    $jobBlock      = [scriptblock]::Create($using:jobStartBlockStr)
 
     # Pre-flight: quick TCP check on WinRM port before attempting full Invoke-Command.
     # Saves ~20s per offline machine (avoids the full WinRM connection timeout).
@@ -708,7 +751,7 @@ $jobResults = $computers | ForEach-Object -Parallel {
         Write-Host "[$site] Starting update job..." -ForegroundColor Yellow
 
         Invoke-Command -ComputerName $IP -Credential $cred -ErrorAction Stop `
-            -ArgumentList $rtPath -ScriptBlock ($using:jobStartBlock)
+            -ArgumentList $rtPath -ScriptBlock $jobBlock
 
         Write-Host "[$site] ✓ Update job started successfully" -ForegroundColor Green
         return [PSCustomObject]@{
@@ -801,6 +844,7 @@ foreach ($computer in $computers) {
         InstalledWithErrors = 0
         RebootRequired = $false
         CollectionError = ""
+        PreviousRunArchive = ""
     }
     
     # Skip log collection for computers whose job never started (Phase 1 failure)
@@ -849,7 +893,25 @@ foreach ($computer in $computers) {
                 if ($fileInfo.Exists) {
                     # Copy the file to local machine
                     Copy-Item -FromSession $session -Path $remoteLogPath -Destination $tempLocalFile -Force -ErrorAction Stop
-                    
+
+                    # Check for archived previous run logs (same-day rerun)
+                    try {
+                        $archiveInfo = Invoke-Command -Session $session -ArgumentList $RemoteTempPath -ScriptBlock {
+                            param($rtPath)
+                            $archives = Get-ChildItem "$rtPath\archive_*" -Directory -ErrorAction SilentlyContinue |
+                                Where-Object { $_.CreationTime.Date -eq (Get-Date).Date } |
+                                Sort-Object CreationTime -Descending | Select-Object -First 1
+                            if ($archives -and (Test-Path "$($archives.FullName)\updatelog.csv")) {
+                                @{ Path = "$($archives.FullName)\updatelog.csv"; Name = $archives.Name; Time = $archives.CreationTime }
+                            }
+                        } -ErrorAction SilentlyContinue
+                        if ($archiveInfo) {
+                            $prevLocalFile = "$sessionReportPath\previous_updatelog_${computerName}.csv"
+                            Copy-Item -FromSession $session -Path $archiveInfo.Path -Destination $prevLocalFile -Force -ErrorAction SilentlyContinue
+                            $summary.PreviousRunArchive = $archiveInfo.Name
+                        }
+                    } catch { }
+
                     # Now read the local copy
                     $updates = Import-Csv $tempLocalFile -ErrorAction Stop
 
@@ -1163,6 +1225,21 @@ $discrepancies = @($allUpdateData | Where-Object {
     ($_.Status -in @('Failed', 'Aborted') -and $_.Verified -eq 'Yes')
 })
 $discrepancyComputers = @($discrepancies | Select-Object -ExpandProperty ComputerName -Unique)
+
+# Load previous run data for rerun diff (keyed by computer name)
+$previousRunData = @{}
+foreach ($cs in $computerSummary) {
+    if ($cs.PreviousRunArchive -and $cs.PreviousRunArchive -ne '') {
+        $prevFile = "$sessionReportPath\previous_updatelog_$($cs.ComputerName).csv"
+        if (Test-Path $prevFile) {
+            try {
+                $prevUpdates = Import-Csv $prevFile -ErrorAction Stop
+                $previousRunData[$cs.ComputerName] = $prevUpdates
+            } catch { }
+        }
+    }
+}
+$rerunComputers = @($computerSummary | Where-Object { $_.PreviousRunArchive -ne '' })
 
 # Get computers with failures for the alert section
 $computersWithFailures = $computerSummary | Where-Object { $_.Failed -gt 0 } | Sort-Object Failed -Descending
@@ -1594,6 +1671,10 @@ foreach ($summary in $computerSummary | Sort-Object @{Expression={if([int]$_.Fai
         '<span class="badge-sm reboot">Yes</span>'
     } else { "" }
 
+    $rerunBadge = if ($summary.PreviousRunArchive -and $summary.PreviousRunArchive -ne '') {
+        ' <span class="badge-sm" style="background:#e0e7ff;color:#4338ca;font-size:0.7em;">Rerun</span>'
+    } else { "" }
+
     $installedCount = if ([int]$summary.Installed -gt 0) { $summary.Installed } else { "-" }
     $failedCount = if ([int]$summary.Failed -gt 0) { $summary.Failed } else { "-" }
     $skippedCount = if ([int]$summary.Skipped -gt 0) { $summary.Skipped } else { "-" }
@@ -1603,7 +1684,7 @@ foreach ($summary in $computerSummary | Sort-Object @{Expression={if([int]$_.Fai
                     <tr class="$rowClass" data-computer="$computerName" data-status="$($summary.Status)" id="computer-$cleanName" onclick="toggleComputer('$cleanName')">
                         <td><span class="expand-chevron">&#9654;</span></td>
                         <td>$statusBadge</td>
-                        <td class="computer-name-cell" title="$safeComputerName">$safeComputerName</td>
+                        <td class="computer-name-cell" title="$safeComputerName">$safeComputerName$rerunBadge</td>
                         <td class="ip-cell">$(ConvertTo-HtmlEncoded $summary.IP)</td>
                         <td class="count-cell installed">$installedCount</td>
                         <td class="count-cell failed">$failedCount</td>
@@ -1687,6 +1768,49 @@ foreach ($summary in $computerSummary | Sort-Object @{Expression={if([int]$_.Fai
         $html += "                                <div class=`"no-data`" style=`"color:#dc2626;`">Error: $safeError</div>`n"
     } else {
         $html += "                                <div class=`"no-data`">No update data available</div>`n"
+    }
+
+    # Previous run diff section (for same-day reruns)
+    if ($previousRunData.ContainsKey($computerName)) {
+        $prevUpdates = $previousRunData[$computerName]
+        $prevKBs = @{}
+        foreach ($pu in $prevUpdates) {
+            $pk = if ($pu.KB -and $pu.KB -ne '') { $pu.KB } else { $pu.Title }
+            $prevKBs[$pk] = $pu
+        }
+        # Find new updates in this run that weren't in the previous run
+        $newInThisRun = @($computerData | Where-Object {
+            $k = if ($_.KB -and $_.KB -ne '') { $_.KB } else { $_.Title }
+            -not $prevKBs.ContainsKey($k)
+        })
+        $newBadge = if ($newInThisRun.Count -gt 0) { " &mdash; <strong>$($newInThisRun.Count) new</strong>" } else { "" }
+
+        $html += @"
+                                <details class="prev-run-details" style="margin-top:12px;">
+                                    <summary style="cursor:pointer;font-size:0.85em;color:#6366f1;font-weight:600;">&#128337; Previous Run ($($summary.PreviousRunArchive -replace 'archive_',''))$newBadge</summary>
+                                    <table class="update-table" style="margin-top:6px;opacity:0.75;">
+                                        <thead><tr>
+                                            <th style="width:12%">KB</th>
+                                            <th style="width:52%">Update Title</th>
+                                            <th style="width:18%">Status</th>
+                                            <th style="width:18%">Result</th>
+                                        </tr></thead>
+                                        <tbody>
+"@
+        foreach ($pu in $prevUpdates) {
+            $puKb = if ($pu.KB -and $pu.KB -ne 'N/A' -and $pu.KB -ne '') {
+                "<span class='kb-badge'>$(ConvertTo-HtmlEncoded $pu.KB)</span>"
+            } else { "<span style='color:#94a3b8;'>-</span>" }
+            $puTitle = ConvertTo-HtmlEncoded $pu.Title
+            $puResult = if ($pu.Result) { ConvertTo-HtmlEncoded $pu.Result.ToString() } else { "" }
+            $puStatus = if ($pu.Status) { ConvertTo-HtmlEncoded $pu.Status.ToString() } else { "" }
+            $html += "                                            <tr><td>$puKb</td><td>$puTitle</td><td>$puStatus</td><td>$puResult</td></tr>`n"
+        }
+        $html += @"
+                                        </tbody>
+                                    </table>
+                                </details>
+"@
     }
 
     $html += @"
