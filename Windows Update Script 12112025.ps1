@@ -31,9 +31,85 @@ param(
 
     # Seconds to wait for WSMan TCP reachability before marking a host unreachable
     [Parameter(Mandatory=$false)]
-    [int]$WSManTimeoutSeconds = 10
+    [int]$WSManTimeoutSeconds = 10,
+
+    # Regenerate the HTML report from an existing session folder (skips Phases 1-3)
+    [switch]$ReportOnly,
+
+    # Path to an existing session folder containing CSVs (required with -ReportOnly)
+    [Parameter(Mandatory=$false)]
+    [string]$SessionPath
 )
  
+if ($ReportOnly) {
+    # ============================================
+    # REPORT-ONLY MODE: Load existing session data
+    # ============================================
+    if (-not $SessionPath -or -not (Test-Path $SessionPath)) {
+        Write-Host "ERROR: -SessionPath must point to an existing session folder when using -ReportOnly" -ForegroundColor Red
+        exit
+    }
+    $summaryFile = Join-Path $SessionPath "computer_summary.csv"
+    if (-not (Test-Path $summaryFile)) {
+        Write-Host "ERROR: computer_summary.csv not found in $SessionPath" -ForegroundColor Red
+        exit
+    }
+
+    $sessionReportPath = $SessionPath
+    # Extract timestamp from folder name (Session_YYYYMMDD_HHMMSS) or use current
+    if ($SessionPath -match '(\d{8}_\d{6})') {
+        $timestamp = $Matches[1]
+    } else {
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    }
+
+    Write-Host "`nReport-Only Mode: Regenerating HTML from $SessionPath" -ForegroundColor Cyan
+
+    # Load CSVs
+    $computerSummary = Import-Csv $summaryFile
+    $allUpdatesFile = Join-Path $SessionPath "all_updates.csv"
+    if (Test-Path $allUpdatesFile) {
+        $allUpdateData = @(Import-Csv $allUpdatesFile)
+    } else {
+        $allUpdateData = @()
+    }
+    $rerunFile = Join-Path $SessionPath "rerun_computers.csv"
+    if (Test-Path $rerunFile) {
+        $rerunList = @(Import-Csv $rerunFile)
+    } else {
+        $rerunList = $null
+    }
+
+    # Deduplicate all_updates.csv (existing data has duplicates from PSWindowsUpdate)
+    $seen = @{}
+    $allUpdateData = @($allUpdateData | Where-Object {
+        $key = "$($_.ComputerName)|$(if ($_.KB -and $_.KB -ne '') { $_.KB } else { $_.Title })"
+        if ($seen.ContainsKey($key)) { return $false }
+        $seen[$key] = $true
+        return $true
+    })
+
+    # Recalculate per-computer summary counts from deduplicated data
+    $updatesByComputer = $allUpdateData | Group-Object ComputerName
+    foreach ($summary in $computerSummary) {
+        $group = $updatesByComputer | Where-Object { $_.Name -eq $summary.ComputerName }
+        if ($group) {
+            $updates = $group.Group
+            $summary.TotalUpdates = $updates.Count
+            $summary.Installed = ($updates | Where-Object { $_.Status -in @('Installed') }).Count
+            $summary.Failed = ($updates | Where-Object { $_.Status -in @('Failed', 'Aborted') }).Count
+            $summary.Skipped = ($updates | Where-Object { $_.Status -eq 'Skipped' }).Count
+            $summary.InstalledWithErrors = ($updates | Where-Object { $_.Status -eq 'InstalledWithErrors' }).Count
+        }
+    }
+
+    Write-Host "Loaded $($computerSummary.Count) computers, $($allUpdateData.Count) unique updates" -ForegroundColor Green
+
+} else {
+# ============================================
+# FULL DEPLOYMENT MODE: Phases 1-3
+# ============================================
+
 Add-Type -AssemblyName System.Windows.Forms
 
 # Clean up any leftover local temp update-log files when the script exits (including Ctrl+C)
@@ -45,9 +121,9 @@ Register-EngineEvent PowerShell.Exiting -Action {
 # ============================================
 # INITIALIZATION
 # ============================================
- 
+
 # Credentials
- 
+
 $cred = Get-Credential -Message "Enter administrator credentials for remote computers"
 Write-Host "Choose CSV file for computer list..." -ForegroundColor Cyan
 $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
@@ -697,10 +773,18 @@ foreach ($computer in $computers) {
                     
                     # Process the updates with comprehensive parsing
                     if ($updates.Count -gt 0) {
+                        # Deduplicate: PSWindowsUpdate may log multiple rows per update
+                        $seenUpdates = @{}
+
                         foreach ($update in $updates) {
                             # Get values as strings for comparison
                             $resultValue = if ($update.Result) { $update.Result.ToString().Trim() } else { "" }
                             $statusValue = if ($update.Status) { $update.Status.ToString().Trim() } else { "" }
+
+                            # Skip duplicates (same KB or Title for this computer)
+                            $dedupKey = if ($update.KB -and $update.KB -ne '') { $update.KB } else { $update.Title }
+                            if ($seenUpdates.ContainsKey($dedupKey)) { continue }
+                            $seenUpdates[$dedupKey] = $true
                             
                             # Determine actual status
                             $actualStatus = "Unknown"
@@ -788,8 +872,8 @@ foreach ($computer in $computers) {
                             }
                         }
  
-                        # Total updates count includes all updates (including definition/Intel updates)
-                        $summary.TotalUpdates = $updates.Count
+                        # Total updates count (deduplicated)
+                        $summary.TotalUpdates = $seenUpdates.Count
                         $summary.RebootRequired = $rebootStatus
                         
                         Write-Host "Collected $($summary.TotalUpdates) updates " -NoNewline
@@ -873,9 +957,11 @@ $failedComputers = ($computerSummary | Where-Object { $_.Failed -gt 0 }).Count
 if ($failedComputers -gt 0) {
     Write-Host "⚠️ $failedComputers computer(s) have failed updates" -ForegroundColor Red
 }
- 
+
+} # End of Full Deployment Mode (else block)
+
 # ============================================
-# PHASE 4: GENERATE HTML REPORT (FIXED VERSION)
+# PHASE 4: GENERATE HTML REPORT
 # ============================================
  
 Write-Host "`n╔══ Phase 4: Generating HTML Report ══╗" -ForegroundColor Cyan
@@ -914,10 +1000,12 @@ function ConvertTo-HtmlEncoded([string]$text) {
 # Build JS array for the HTML re-run banner (injected as a const into the report)
 $rerunJsArray = if ($rerunList -and $rerunList.Count -gt 0) {
     $entries = $rerunList | ForEach-Object {
+        # ReportOnly loads CSV with Name column; live mode uses ComputerName
+        $compName = if ($_.ComputerName) { $_.ComputerName } else { $_.Name }
         $reason = if ($_.Failed -gt 0) {
             "$($_.Failed) failed update$(if($_.Failed -ne 1){'s'})"
-        } else { $_.Status }
-        $safeName = $_.ComputerName -replace '"', '\"' -replace '\\', '\\\\'
+        } elseif ($_.Status) { $_.Status } else { "Needs rerun" }
+        $safeName = $compName -replace '"', '\"' -replace '\\', '\\\\'
         $safeIP   = $_.IP -replace '"', '\"'
         "{name:`"$safeName`",ip:`"$safeIP`",reason:`"$reason`"}"
     }
@@ -933,1089 +1021,466 @@ $html = @"
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Windows Update Report - $(Get-Date -Format "yyyy-MM-dd HH:mm")</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
+            background: #f0f2f5; min-height: 100vh;
         }
-        
-        @keyframes gradientShift {
-            0%, 100% { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
-            50% { background: linear-gradient(135deg, #764ba2 0%, #667eea 100%); }
-        }
-        
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-        
-        .header {
-            background: white;
-            border-radius: 20px;
-            padding: 30px;
-            margin-bottom: 30px;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
-            animation: slideDown 0.5s ease-out;
-        }
-        
-        @keyframes slideDown {
-            from {
-                opacity: 0;
-                transform: translateY(-30px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-        
-        h1 {
-            color: #1a202c;
-            font-size: 2.5em;
-            margin-bottom: 10px;
-            display: flex;
-            align-items: center;
-            gap: 15px;
-        }
-        
-        .timestamp {
-            color: #718096;
-            font-size: 0.9em;
-            margin-bottom: 5px;
-        }
-        
-        .session-id {
-            color: #a0aec0;
-            font-size: 0.85em;
-            font-family: 'Courier New', monospace;
-        }
-        
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 20px;
-            margin-top: 30px;
-        }
-        
-        .stat-card {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 25px;
-            border-radius: 15px;
-            text-align: center;
-            box-shadow: 0 10px 25px rgba(0,0,0,0.1);
-            transition: all 0.3s ease;
-            animation: fadeIn 0.5s ease-out;
-        }
-        
-        @keyframes fadeIn {
-            from {
-                opacity: 0;
-                transform: scale(0.9);
-            }
-            to {
-                opacity: 1;
-                transform: scale(1);
-            }
-        }
-        
-        .stat-card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 15px 35px rgba(0,0,0,0.15);
-        }
-        
-        .stat-card.success {
-            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
-        }
-        
-        .stat-card.error {
-            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
-        }
-        
-        .stat-card.warning {
-            background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
-        }
-        
-        .stat-card.info {
-            background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
-        }
-        
-        .stat-value {
-            font-size: 3em;
-            font-weight: bold;
-            margin-bottom: 5px;
-            animation: countUp 1s ease-out;
-        }
-        
-        @keyframes countUp {
-            from {
-                opacity: 0;
-                transform: translateY(20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-        
-        .stat-label {
-            font-size: 0.9em;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            opacity: 0.95;
-        }
-        
-        /* Failure alert section */
-        .failure-alert {
-            background: white;
-            border-radius: 15px;
-            margin-bottom: 25px;
-            padding: 0;
-            box-shadow: 0 10px 25px rgba(239, 68, 68, 0.15);
-            overflow: hidden;
-            animation: slideIn 0.6s ease-out;
-            border: 2px solid #fee2e2;
-        }
-        
-        .connection-alert {
-            background: white;
-            border-radius: 15px;
-            margin-bottom: 25px;
-            padding: 0;
-            box-shadow: 0 10px 25px rgba(236, 72, 153, 0.15);
-            overflow: hidden;
-            animation: slideIn 0.6s ease-out;
-            border: 2px solid #fce7f3;
-        }
-        
-        @keyframes slideIn {
-            from {
-                opacity: 0;
-                transform: translateX(-30px);
-            }
-            to {
-                opacity: 1;
-                transform: translateX(0);
-            }
-        }
-        
-        .failure-alert-header {
-            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
-            color: white;
-            padding: 20px 25px;
-            display: flex;
-            align-items: center;
-            gap: 15px;
-        }
-        
-        .connection-alert-header {
-            background: linear-gradient(135deg, #ec4899 0%, #be185d 100%);
-            color: white;
-            padding: 20px 25px;
-            display: flex;
-            align-items: center;
-            gap: 15px;
-        }
-        
-        .failure-alert-icon {
-            font-size: 1.5em;
-            animation: pulse 2s ease-in-out infinite;
-        }
-        
-        @keyframes pulse {
-            0%, 100% { transform: scale(1); }
-            50% { transform: scale(1.1); }
-        }
-        
-        .failure-alert-title {
-            font-size: 1.3em;
-            font-weight: 600;
-        }
-        
-        .failure-alert-subtitle {
-            font-size: 0.9em;
-            opacity: 0.9;
-            margin-left: auto;
-        }
-        
-        .failure-list {
-            padding: 20px 25px;
-            background: #fef2f2;
-        }
-        
-        .failure-item {
-            background: white;
-            border-left: 4px solid #ef4444;
-            padding: 12px 20px;
-            margin-bottom: 12px;
-            border-radius: 8px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            transition: all 0.3s ease;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-            cursor: pointer;
-        }
-        
-        .failure-item:hover {
-            transform: translateX(5px);
-            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-        }
-        
-        .failure-item:last-child {
-            margin-bottom: 0;
-        }
-        
-        .failure-computer-name {
-            font-weight: 600;
-            color: #1f2937;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        
-        .failure-computer-ip {
-            color: #6b7280;
-            font-size: 0.9em;
-        }
-        
-        .failure-count {
-            background: #ef4444;
-            color: white;
-            padding: 6px 14px;
-            border-radius: 20px;
-            font-weight: bold;
-            font-size: 0.9em;
-        }
-        
-        .failure-details {
-            display: flex;
-            align-items: center;
-            gap: 15px;
-        }
-        
-        .controls {
-            background: white;
-            border-radius: 15px;
-            padding: 20px;
-            margin-bottom: 20px;
-            box-shadow: 0 10px 25px rgba(0,0,0,0.1);
-            display: flex;
-            gap: 15px;
-            align-items: center;
-            flex-wrap: wrap;
-        }
-        
-        .btn {
-            padding: 10px 20px;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: 600;
-            transition: all 0.3s ease;
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-        }
-        
-        .btn-primary {
-            background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
-            color: white;
-        }
-        
-        .btn-primary:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(59, 130, 246, 0.3);
-        }
-        
-        .btn-secondary {
-            background: linear-gradient(135deg, #6b7280 0%, #4b5563 100%);
-            color: white;
-        }
-        
-        .btn-secondary:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(107, 114, 128, 0.3);
-        }
-        
-        .btn-danger {
-            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
-            color: white;
-        }
-        
-        .btn-danger:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(239, 68, 68, 0.3);
-        }
-        
-        .search-box {
-            flex: 1;
-            min-width: 250px;
-            padding: 10px 15px;
-            border: 2px solid #e5e7eb;
-            border-radius: 8px;
-            font-size: 14px;
-            transition: all 0.3s ease;
-        }
-        
-        .search-box:focus {
-            outline: none;
-            border-color: #3b82f6;
-            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
-        }
-        
-        .computer-card {
-            background: white;
-            border-radius: 15px;
-            margin-bottom: 20px;
-            box-shadow: 0 10px 25px rgba(0,0,0,0.1);
-            overflow: hidden;
-            animation: slideUp 0.5s ease-out;
-            transition: all 0.3s ease;
-        }
-        
-        .computer-card.has-failures {
-            border: 2px solid #fee2e2;
-            box-shadow: 0 10px 25px rgba(239, 68, 68, 0.1);
-        }
-        
-        .computer-card.unreachable {
-            border: 2px solid #fce7f3;
-            box-shadow: 0 10px 25px rgba(236, 72, 153, 0.1);
-        }
-        
-        @keyframes slideUp {
-            from {
-                opacity: 0;
-                transform: translateY(30px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-        
-        .computer-card:hover {
-            box-shadow: 0 15px 35px rgba(0,0,0,0.15);
-        }
-        
-        .computer-header {
+        /* Top bar */
+        .topbar {
             background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
-            color: white;
-            padding: 20px 25px;
-            cursor: pointer;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            transition: all 0.3s ease;
+            color: white; padding: 16px 24px;
+            display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;
         }
-        
-        .computer-header:hover {
-            background: linear-gradient(135deg, #334155 0%, #475569 100%);
+        .topbar h1 { font-size: 1.4em; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+        .topbar-meta { font-size: 0.8em; opacity: 0.7; }
+        /* Stats strip */
+        .stats-strip {
+            display: flex; flex-wrap: wrap; gap: 0; background: white;
+            border-bottom: 1px solid #e2e8f0; box-shadow: 0 1px 3px rgba(0,0,0,0.06);
         }
-        
-        .computer-header.expanded {
-            background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+        .stat-item {
+            flex: 1; min-width: 120px; padding: 14px 20px; text-align: center;
+            border-right: 1px solid #e2e8f0; transition: background 0.2s;
         }
-        
-        .computer-header.has-failures {
-            background: linear-gradient(135deg, #991b1b 0%, #dc2626 100%);
+        .stat-item:last-child { border-right: none; }
+        .stat-item:hover { background: #f8fafc; }
+        .stat-value { font-size: 1.8em; font-weight: 700; line-height: 1.2; }
+        .stat-label { font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.5px; color: #64748b; margin-top: 2px; }
+        .stat-item.blue .stat-value { color: #2563eb; }
+        .stat-item.green .stat-value { color: #16a34a; }
+        .stat-item.red .stat-value { color: #dc2626; }
+        .stat-item.amber .stat-value { color: #d97706; }
+        .stat-item.purple .stat-value { color: #7c3aed; }
+        /* Alert banners */
+        .alert-banner {
+            margin: 12px 16px 0; border-radius: 10px; overflow: hidden;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.08);
         }
-        
-        .computer-header.has-failures:hover {
-            background: linear-gradient(135deg, #dc2626 0%, #ef4444 100%);
+        .alert-header {
+            padding: 10px 16px; display: flex; align-items: center; gap: 10px;
+            cursor: pointer; user-select: none; font-weight: 600; font-size: 0.9em;
         }
-        
-        .computer-header.unreachable {
-            background: linear-gradient(135deg, #be185d 0%, #ec4899 100%);
+        .alert-header .toggle-icon { margin-left: auto; transition: transform 0.2s; font-size: 0.8em; }
+        .alert-header.collapsed .toggle-icon { transform: rotate(-90deg); }
+        .alert-body { padding: 0 16px 12px; }
+        .alert-body.collapsed { display: none; }
+        .alert-banner.failure { background: #fef2f2; border: 1px solid #fecaca; }
+        .alert-banner.failure .alert-header { color: #991b1b; }
+        .alert-banner.connection { background: #fdf4ff; border: 1px solid #f5d0fe; }
+        .alert-banner.connection .alert-header { color: #86198f; }
+        .alert-banner.rerun { background: #fffbeb; border: 1px solid #fde68a; }
+        .alert-banner.rerun .alert-header { color: #92400e; }
+        .alert-chip {
+            display: inline-flex; align-items: center; gap: 6px;
+            padding: 4px 10px; border-radius: 6px; font-size: 0.82em;
+            cursor: pointer; transition: all 0.15s; margin: 3px;
         }
-        
-        .computer-header.unreachable:hover {
-            background: linear-gradient(135deg, #ec4899 0%, #f472b6 100%);
+        .alert-chip:hover { filter: brightness(0.95); transform: translateX(2px); }
+        .alert-chip.fail { background: white; border: 1px solid #fca5a5; color: #991b1b; }
+        .alert-chip.conn { background: white; border: 1px solid #e9d5ff; color: #86198f; }
+        .alert-chip .chip-count { background: #ef4444; color: white; padding: 1px 7px; border-radius: 10px; font-weight: 700; font-size: 0.85em; }
+        /* Dashboard layout */
+        .dashboard { display: flex; height: calc(100vh - 200px); min-height: 500px; }
+        .sidebar {
+            width: 240px; flex-shrink: 0; background: white; border-right: 1px solid #e2e8f0;
+            display: flex; flex-direction: column; overflow-y: auto;
         }
-        
-        .computer-info {
-            display: flex;
-            align-items: center;
-            gap: 25px;
-            flex: 1;
+        .sidebar-section { padding: 14px 16px; border-bottom: 1px solid #f1f5f9; }
+        .sidebar-section h3 { font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.5px; color: #94a3b8; margin-bottom: 8px; }
+        .sidebar input[type="text"] {
+            width: 100%; padding: 8px 10px; border: 1px solid #e2e8f0; border-radius: 6px;
+            font-size: 0.85em; outline: none; transition: border-color 0.2s;
         }
-        
-        .computer-name {
-            font-size: 1.3em;
-            font-weight: bold;
-            display: flex;
-            align-items: center;
-            gap: 10px;
+        .sidebar input[type="text"]:focus { border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59,130,246,0.1); }
+        /* Status filter pills */
+        .status-pills { display: flex; flex-wrap: wrap; gap: 4px; }
+        .status-pill {
+            padding: 4px 10px; border-radius: 20px; font-size: 0.78em; font-weight: 500;
+            cursor: pointer; border: 1px solid #e2e8f0; background: white; transition: all 0.15s;
         }
-        
-        .computer-ip {
-            color: #94a3b8;
-            font-size: 0.9em;
+        .status-pill:hover { background: #f1f5f9; }
+        .status-pill.active { background: #1e293b; color: white; border-color: #1e293b; }
+        /* Sidebar buttons */
+        .sidebar-btn {
+            display: block; width: 100%; padding: 7px 10px; margin-bottom: 4px;
+            border: 1px solid #e2e8f0; border-radius: 6px; background: white;
+            font-size: 0.82em; cursor: pointer; text-align: left; transition: all 0.15s;
         }
-        
-        .update-summary {
-            display: flex;
-            gap: 12px;
-            align-items: center;
+        .sidebar-btn:hover { background: #f8fafc; border-color: #cbd5e1; }
+        .sidebar-btn.danger { color: #dc2626; border-color: #fecaca; }
+        .sidebar-btn.danger:hover { background: #fef2f2; }
+        /* Update filter checkboxes */
+        .update-filter-list { max-height: 250px; overflow-y: auto; }
+        .update-filter-item {
+            display: flex; align-items: center; gap: 6px; padding: 3px 0; font-size: 0.8em; color: #374151;
         }
-        
-        .summary-badge {
-            padding: 6px 14px;
-            border-radius: 20px;
-            font-size: 0.85em;
-            font-weight: 600;
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
+        .update-filter-item input { flex-shrink: 0; }
+        .update-filter-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        /* Main content area */
+        .main-content { flex: 1; overflow: auto; padding: 0; }
+        /* Computer table */
+        .computer-table { width: 100%; border-collapse: collapse; }
+        .computer-table thead { position: sticky; top: 0; z-index: 2; }
+        .computer-table th {
+            background: #f8fafc; color: #475569; padding: 8px 8px; text-align: left;
+            font-size: 0.72em; text-transform: uppercase; letter-spacing: 0.3px; font-weight: 600;
+            border-bottom: 2px solid #e2e8f0; white-space: nowrap; cursor: pointer; user-select: none;
         }
-        
-        .badge-success {
-            background: rgba(16, 185, 129, 0.2);
-            color: #10b981;
+        .computer-table th:hover { background: #f1f5f9; }
+        .computer-row {
+            cursor: pointer; transition: background 0.1s;
         }
-        
-        .badge-error {
-            background: rgba(239, 68, 68, 0.2);
-            color: #ef4444;
+        .computer-row:hover { background: #f8fafc; }
+        .computer-row td {
+            padding: 7px 8px; border-bottom: 1px solid #f1f5f9;
+            font-size: 0.82em; white-space: nowrap;
         }
-        
-        .badge-warning {
-            background: rgba(245, 158, 11, 0.2);
-            color: #f59e0b;
+        .computer-row.has-failures { background: #fff5f5; }
+        .computer-row.has-failures:hover { background: #fef2f2; }
+        .computer-row.unreachable { background: #fdf4ff; }
+        .computer-row.expanded { background: #eff6ff; }
+        .computer-row td:first-child { width: 30px; text-align: center; }
+        .computer-name-cell { max-width: 220px; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
+        .ip-cell { color: #64748b; font-family: 'SF Mono', Consolas, monospace; font-size: 0.78em; }
+        .count-cell { text-align: center; font-weight: 600; min-width: 36px; }
+        .count-cell.installed { color: #16a34a; }
+        .count-cell.failed { color: #dc2626; }
+        .count-cell.skipped { color: #94a3b8; }
+        .badge-sm {
+            display: inline-block; padding: 2px 8px; border-radius: 10px;
+            font-size: 0.75em; font-weight: 600;
         }
-        
-        .badge-info {
-            background: rgba(59, 130, 246, 0.2);
-            color: #3b82f6;
+        .badge-sm.reboot { background: #fef3c7; color: #92400e; }
+        .badge-sm.status-ok { background: #dcfce7; color: #166534; }
+        .badge-sm.status-fail { background: #fee2e2; color: #991b1b; }
+        .badge-sm.status-warn { background: #fef3c7; color: #92400e; }
+        .badge-sm.status-skip { background: #f1f5f9; color: #475569; }
+        .expand-chevron { transition: transform 0.2s; font-size: 0.7em; color: #94a3b8; }
+        .computer-row.expanded .expand-chevron { transform: rotate(90deg); }
+        /* Detail panel (hidden row beneath each computer) */
+        .detail-row { display: none; }
+        .detail-row.visible { display: table-row; }
+        .detail-panel {
+            padding: 12px 20px 16px; background: #f8fafc; border-bottom: 2px solid #e2e8f0;
         }
-        
-        .expand-icon {
-            font-size: 1.2em;
-            transition: transform 0.3s ease;
+        .detail-panel .reboot-note {
+            background: #fef3c7; border-left: 3px solid #f59e0b; padding: 6px 12px;
+            font-size: 0.85em; color: #92400e; margin-bottom: 10px; border-radius: 0 6px 6px 0;
         }
-        
-        .computer-header.expanded .expand-icon {
-            transform: rotate(180deg);
-        }
-        
-        .computer-content {
-            max-height: 0;
-            overflow: hidden;
-            transition: max-height 0.45s ease, padding 0.25s ease;
-            background: #fafafa;
-            padding: 0 20px; /* keep header/content spacing when collapsed */
-        }
- 
-        /* When expanded, constrain height responsively and allow internal scrolling */
-        .computer-content.expanded {
-            /* Responsive max-height: at least 240px, ideally viewport minus header area, at most 720px */
-            max-height: clamp(240px, calc(100vh - 360px), 720px);
-            overflow-y: auto;
-            padding: 20px; /* add breathing room when open */
-        }
- 
-        /* Subtle, cross-browser scrollbar styling for modern browsers */
-        .computer-content.expanded::-webkit-scrollbar {
-            width: 12px;
-        }
-        .computer-content.expanded::-webkit-scrollbar-track {
-            background: #f1f5f9;
-            border-radius: 8px;
-        }
-        .computer-content.expanded::-webkit-scrollbar-thumb {
-            background: #cbd5e1;
-            border-radius: 8px;
-        }
-        
-        .update-table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-        
+        .detail-panel .no-data { padding: 20px; text-align: center; color: #94a3b8; font-size: 0.9em; }
+        /* Update sub-table inside detail panel */
+        .update-table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
         .update-table th {
-            background: #f1f5f9;
-            padding: 12px 15px;
-            text-align: left;
-            font-weight: 600;
-            color: #475569;
-            font-size: 0.85em;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            border-bottom: 2px solid #e2e8f0;
+            background: #e2e8f0; color: #475569; padding: 7px 10px; text-align: left;
+            font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.3px;
+            position: static;
         }
-        
-        .update-table td {
-            padding: 12px 15px;
-            border-bottom: 1px solid #e2e8f0;
-            font-size: 0.9em;
-            background: white;
-        }
-        
-        .update-table tr:hover td {
-            background: #f8fafc;
-        }
-        
-        .update-table tr.failed-row {
-            background-color: #fef2f2 !important;
-            border-left: 3px solid #ef4444;
-        }
-        
-        .update-table tr.failed-row:hover td {
-            background-color: #fee2e2 !important;
-        }
-        
-        .update-table tr.failed-row td:first-child {
-            padding-left: 12px;
-        }
-        
+        .update-table td { padding: 6px 10px; border-bottom: 1px solid #e2e8f0; }
+        .update-table tr.failed-row { background: #fef2f2; }
+        .update-table tr.hidden { display: none; }
         .kb-badge {
-            background: #e2e8f0;
-            padding: 4px 10px;
-            border-radius: 6px;
-            font-family: 'Courier New', monospace;
-            font-size: 0.85em;
-            font-weight: bold;
-            color: #475569;
+            background: #e0e7ff; color: #3730a3; padding: 2px 8px; border-radius: 4px;
+            font-family: 'SF Mono', Consolas, monospace; font-size: 0.9em;
         }
-        
-        .status-icon {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            font-weight: 600;
-        }
-        
-        .status-installed {
-            color: #10b981;
-        }
-        
-        .status-failed {
-            color: #ef4444;
-            font-weight: 700;
-        }
-        
-        .status-warning {
-            color: #f59e0b;
-        }
-        
-        .reboot-warning {
-            background: linear-gradient(135deg, #fef3c7 0%, #fed7aa 100%);
-            border-left: 4px solid #f59e0b;
-            padding: 12px 20px;
-            margin: 20px;
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            border-radius: 8px;
-            font-weight: 500;
-            color: #92400e;
-        }
-        
+        .status-icon { font-weight: 500; }
+        .status-installed { color: #16a34a; }
+        .status-failed { color: #dc2626; }
+        .status-warning { color: #d97706; }
+        /* Footer */
         .footer {
-            text-align: center;
-            margin-top: 50px;
-            padding: 30px;
-            color: white;
-            opacity: 0.9;
+            text-align: center; padding: 16px; color: #94a3b8; font-size: 0.8em;
+            border-top: 1px solid #e2e8f0; background: white;
         }
-        
-        .hidden {
-            display: none !important;
-        }
-        
-        @media (max-width: 768px) {
-            .stats-grid {
-                grid-template-columns: 1fr 1fr;
-            }
-            
-            .computer-info {
-                flex-direction: column;
-                align-items: flex-start;
-                gap: 10px;
-            }
-            
-            .update-summary {
-                flex-wrap: wrap;
-            }
-        }
-
-        .rerun-alert {
-            background: white;
-            border-radius: 15px;
-            margin-bottom: 25px;
-            padding: 0;
-            box-shadow: 0 10px 25px rgba(245, 158, 11, 0.15);
-            overflow: hidden;
-            animation: slideIn 0.6s ease-out;
-            border: 2px solid #fde68a;
-        }
-
-        .rerun-alert-header {
-            background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
-            color: white;
-            padding: 20px 25px;
-            display: flex;
-            align-items: center;
-            gap: 15px;
-        }
-
-        .rerun-alert-subtitle {
-            font-size: 0.9em;
-            opacity: 0.9;
-            margin-left: auto;
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-
-        .rerun-detail {
-            padding: 14px 25px;
-            background: #fffbeb;
-            color: #92400e;
-            font-size: 0.88em;
-            line-height: 1.6;
-        }
-
-        .btn-rerun {
-            background: white;
-            color: #d97706;
-            border: 2px solid white;
-            padding: 6px 16px;
-            border-radius: 8px;
-            cursor: pointer;
-            font-weight: 700;
-            font-size: 13px;
-            white-space: nowrap;
-        }
-
-        .btn-rerun:hover {
-            background: #fef3c7;
+        /* Utility */
+        .hidden { display: none !important; }
+        @keyframes highlightRow { 0% { box-shadow: inset 0 0 0 2px #3b82f6; } 100% { box-shadow: none; } }
+        /* Responsive */
+        @media (max-width: 900px) {
+            .dashboard { flex-direction: column; height: auto; }
+            .sidebar { width: 100%; max-height: 300px; border-right: none; border-bottom: 1px solid #e2e8f0; }
+            .stats-strip { flex-wrap: wrap; }
+            .stat-item { min-width: 100px; }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>
-                <span style="font-size: 1.2em;">🔄</span>
-                Windows Update Deployment Report
-            </h1>
-            <div class="timestamp">Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")</div>
-            <div class="session-id">Session ID: $timestamp</div>
-            
-            <div class="stats-grid">
-                <div class="stat-card info">
-                    <div class="stat-value">$totalComputers</div>
-                    <div class="stat-label">Computers</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value">$totalCompleted</div>
-                    <div class="stat-label">Completed</div>
-                </div>
-                <div class="stat-card success">
-                    <div class="stat-value">$totalInstalled</div>
-                    <div class="stat-label">Installed</div>
-                </div>
-                <div class="stat-card error">
-                    <div class="stat-value" id="stat-failed-value">$totalFailed</div>
-                    <div class="stat-label">Failed</div>
-                </div>
-                <div class="stat-card warning">
-                    <div class="stat-value">$computersNeedReboot</div>
-                    <div class="stat-label">Need Reboot</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value" id="stat-total-value">$totalUpdates</div>
-                    <div class="stat-label">Total Updates</div>
-                </div>
-            </div>
+    <div class="topbar">
+        <h1><span>&#128260;</span> Windows Update Deployment Report</h1>
+        <div class="topbar-meta">
+            <div>$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")</div>
+            <div style="opacity:0.6;font-family:monospace;font-size:0.9em;">Session $timestamp</div>
         </div>
+    </div>
+
+    <div class="stats-strip">
+        <div class="stat-item blue"><div class="stat-value">$totalComputers</div><div class="stat-label">Computers</div></div>
+        <div class="stat-item green"><div class="stat-value">$totalCompleted</div><div class="stat-label">Completed</div></div>
+        <div class="stat-item green"><div class="stat-value" id="stat-installed-value">$totalInstalled</div><div class="stat-label">Installed</div></div>
+        <div class="stat-item red"><div class="stat-value" id="stat-failed-value">$totalFailed</div><div class="stat-label">Failed</div></div>
+        <div class="stat-item amber"><div class="stat-value">$computersNeedReboot</div><div class="stat-label">Need Reboot</div></div>
+        <div class="stat-item purple"><div class="stat-value" id="stat-total-value">$totalUpdates</div><div class="stat-label">Total Updates</div></div>
+    </div>
 "@
- 
-# Add failure alert section if there are any computers with failures
+
+# Alert banners
 if ($computersWithFailures.Count -gt 0) {
     $html += @"
-        
-        <div class="failure-alert">
-            <div class="failure-alert-header">
-                <span class="failure-alert-icon">⚠️</span>
-                <div>
-                    <div class="failure-alert-title">Computers with Failed Updates</div>
-                </div>
-                <div class="failure-alert-subtitle">$($computersWithFailures.Count) computer$(if($computersWithFailures.Count -ne 1){'s'}) require$(if($computersWithFailures.Count -eq 1){'s'}) attention</div>
-            </div>
-            <div class="failure-list">
-"@
-    
-    foreach ($failedComputer in $computersWithFailures) {
-        $cleanName = $failedComputer.ComputerName -replace '[^a-zA-Z0-9]', '_'
-        $safeComputerName = ConvertTo-HtmlEncoded $failedComputer.ComputerName
-        $html += @"
-                <div class="failure-item" data-computer="$cleanName" onclick="scrollToComputer('$cleanName')">
-                    <div>
-                        <div class="failure-computer-name">
-                            <span>💻</span>
-                            <span>$safeComputerName</span>
-                        </div>
-                        <div class="failure-computer-ip">$(ConvertTo-HtmlEncoded $failedComputer.IP)</div>
-                    </div>
-                    <div class="failure-details">
-"@
-        
-        if ($failedComputer.Installed -gt 0) {
-            $html += @"
-                        <span class="summary-badge badge-success">✅ $($failedComputer.Installed) installed</span>
-"@
-        }
-        
-        $html += @"
-                        <span class="failure-count">❌ <span class="failure-count-number">$($failedComputer.Failed)</span> failed</span>
-                    </div>
-                </div>
-"@
-    }
-    
-    $html += @"
-            </div>
+    <div class="alert-banner failure">
+        <div class="alert-header" onclick="toggleAlert(this)">
+            <span>&#9888;&#65039;</span>
+            <span>$($computersWithFailures.Count) computer$(if($computersWithFailures.Count -ne 1){'s'}) with failed updates</span>
+            <span class="toggle-icon">&#9660;</span>
         </div>
+        <div class="alert-body" id="failure-alert-body">
+"@
+    foreach ($fc in $computersWithFailures) {
+        $cn = $fc.ComputerName -replace '[^a-zA-Z0-9]', '_'
+        $safeName = ConvertTo-HtmlEncoded $fc.ComputerName
+        $html += "            <span class=`"alert-chip fail`" data-computer=`"$cn`" onclick=`"scrollToComputer('$cn')`">$safeName <span class=`"chip-count`"><span class=`"failure-count-number`">$($fc.Failed)</span></span></span>`n"
+    }
+    $html += @"
+        </div>
+    </div>
 "@
 }
 
-# Get computers with connection failures
-$computersWithConnectionFailures = $computerSummary | Where-Object { $_.Status -eq "Ignored-WSMAN" -or $_.Status -eq "Incomplete" -or $_.Status -eq "CollectionFailed" } | Sort-Object ComputerName
-
-# Add connection failure alert section if there are any computers with connection issues
+$computersWithConnectionFailures = $computerSummary | Where-Object { $_.Status -eq "Ignored-WSMAN" -or $_.Status -eq "Incomplete" -or $_.Status -eq "CollectionFailed" -or $_.Status -eq "JobStartFailed" } | Sort-Object ComputerName
 if ($computersWithConnectionFailures.Count -gt 0) {
     $html += @"
-        
-        <div class="connection-alert">
-            <div class="connection-alert-header">
-                <span class="failure-alert-icon">📡</span>
-                <div>
-                    <div class="failure-alert-title">Computers Unable to Connect</div>
-                </div>
-                <div class="failure-alert-subtitle"><span id="connection-failure-count">$($computersWithConnectionFailures.Count)</span> computer$(if($computersWithConnectionFailures.Count -ne 1){'s'}) could not be reached</div>
-            </div>
-            <div class="failure-list">
+    <div class="alert-banner connection">
+        <div class="alert-header" onclick="toggleAlert(this)">
+            <span>&#128225;</span>
+            <span><span id="connection-failure-count">$($computersWithConnectionFailures.Count)</span> computer$(if($computersWithConnectionFailures.Count -ne 1){'s'}) unable to connect</span>
+            <span class="toggle-icon">&#9660;</span>
+        </div>
+        <div class="alert-body">
 "@
-    
-    foreach ($failedComputer in $computersWithConnectionFailures) {
-        $cleanName = $failedComputer.ComputerName -replace '[^a-zA-Z0-9]', '_'
-        $safeComputerName = ConvertTo-HtmlEncoded $failedComputer.ComputerName
-        $statusReason = switch ($failedComputer.Status) {
-            "Ignored-WSMAN" { "WSMan connectivity failed" }
-            "Incomplete"    { "Job did not complete" }
-            "CollectionFailed" { "Failed to collect results" }
-            default         { "Unknown error" }
+    foreach ($cc in $computersWithConnectionFailures) {
+        $cn = $cc.ComputerName -replace '[^a-zA-Z0-9]', '_'
+        $safeName = ConvertTo-HtmlEncoded $cc.ComputerName
+        $statusReason = switch ($cc.Status) {
+            "Ignored-WSMAN"    { "WSMan failed" }
+            "Incomplete"       { "Incomplete" }
+            "CollectionFailed" { "Collection failed" }
+            "JobStartFailed"   { "Job start failed" }
+            default            { $cc.Status }
         }
-        $html += @"
-                <div class="failure-item" data-computer="$cleanName" onclick="scrollToComputer('$cleanName')">
-                    <div>
-                        <div class="failure-computer-name">
-                            <span>📡</span>
-                            <span>$safeComputerName</span>
-                        </div>
-                        <div class="failure-computer-ip">$(ConvertTo-HtmlEncoded $failedComputer.IP) — $statusReason</div>
-                    </div>
-                </div>
-"@
+        $html += "            <span class=`"alert-chip conn`" onclick=`"scrollToComputer('$cn')`">$safeName &mdash; $statusReason</span>`n"
     }
-    
     $html += @"
-            </div>
         </div>
+    </div>
 "@
 }
 
-# Add re-run banner (hidden by JS if rerunComputers is empty)
+# Rerun banner (hidden by default, shown by JS)
 $html += @"
+    <div class="alert-banner rerun" id="rerun-banner" style="display:none">
+        <div class="alert-header" onclick="toggleAlert(this)">
+            <span>&#128260;</span>
+            <span><span id="rerun-count"></span> computer(s) queued for re-run</span>
+            <button onclick="event.stopPropagation();downloadRerunCSV()" style="margin-left:auto;padding:4px 12px;border-radius:6px;border:1px solid #d97706;background:white;color:#92400e;font-size:0.82em;cursor:pointer;">Download Re-run CSV</button>
+            <span class="toggle-icon">&#9660;</span>
+        </div>
+        <div class="alert-body" id="rerun-detail" style="font-size:0.85em;color:#92400e;"></div>
+    </div>
 
-        <div id="rerun-banner" class="rerun-alert" style="display:none">
-            <div class="rerun-alert-header">
-                <span class="failure-alert-icon">&#128260;</span>
-                <div>
-                    <div class="failure-alert-title">Computers Queued for Re-run</div>
-                </div>
-                <div class="rerun-alert-subtitle">
-                    <span id="rerun-count"></span> computer(s) need another pass
-                    <button class="btn-rerun" onclick="downloadRerunCSV()">&#11015; Download Re-run CSV</button>
+    <div class="dashboard">
+        <div class="sidebar">
+            <div class="sidebar-section">
+                <h3>Search</h3>
+                <input type="text" id="search-input" placeholder="Computer name or IP..." onkeyup="filterComputers(this.value)">
+            </div>
+            <div class="sidebar-section">
+                <h3>Status</h3>
+                <div class="status-pills">
+                    <span class="status-pill active" data-filter="all" onclick="filterByStatus('all',this)">All</span>
+                    <span class="status-pill" data-filter="Completed" onclick="filterByStatus('Completed',this)">Completed</span>
+                    <span class="status-pill" data-filter="NoUpdatesNeeded" onclick="filterByStatus('NoUpdatesNeeded',this)">No Updates</span>
+                    <span class="status-pill" data-filter="failures" onclick="filterByStatus('failures',this)">Failures</span>
+                    <span class="status-pill" data-filter="unreachable" onclick="filterByStatus('unreachable',this)">Unreachable</span>
                 </div>
             </div>
-            <div class="rerun-detail" id="rerun-detail"></div>
-        </div>
+            <div class="sidebar-section">
+                <h3>Actions</h3>
+                <button class="sidebar-btn" onclick="expandAll()">&#128194; Expand All</button>
+                <button class="sidebar-btn" onclick="collapseAll()">&#128193; Collapse All</button>
+                <button class="sidebar-btn" onclick="sortComputersByStatus()">&#128260; Sort by Status</button>
 "@
 
-# Add controls section
-$html += @"
-        
-        <div class="controls">
-            <button class="btn btn-primary" onclick="expandAll()">
-                <span>📂</span> Expand All
-            </button>
-            <button class="btn btn-primary" onclick="sortComputersByStatus()">
-                <span>🔃</span> Sort by Status
-            </button>
-            <button class="btn btn-secondary" onclick="collapseAll()">
-                <span>📁</span> Collapse All
-            </button>
-"@
- 
-# Add a button to jump to failures if they exist
 if ($computersWithFailures.Count -gt 0) {
-    $html += @"
-            <button class="btn btn-danger" onclick="expandFailures()">
-                <span>⚠️</span> Show Failures Only
-            </button>
-"@
+    $html += "                <button class=`"sidebar-btn danger`" onclick=`"expandFailures()`">&#9888;&#65039; Show Failures Only</button>`n"
 }
- 
+
 $html += @"
-            <input type="text" class="search-box" placeholder="🔍 Search computers or updates..." onkeyup="filterComputers(this.value)">
-        </div>
-        <div class="controls" style="margin-bottom: 10px;">
-            <strong style="margin-right:10px;">Filter updates:</strong>
-            <div style="display:flex;align-items:center;gap:8px;">
-                <button type="button" onclick="document.getElementById('update-filters-body').classList.toggle('hidden')" style="padding:6px 10px;border-radius:8px;border:1px solid #e5e7eb;background:#fff;">Toggle filters</button>
-                <div style="font-size:0.95em;color:#6b7280">Unique updates: <span id="unique-updates-count">$($uniqueUpdates.Keys.Count)</span> | Computers shown: <span id="filtered-computer-count">$($computerSummary.Count)</span></div>
-                <div style="flex:1"></div>
-                <label style="display:inline-flex;align-items:center;gap:6px;background:#fff;padding:6px 10px;border-radius:8px;border:1px solid #e5e7eb;">
-                    <input type="checkbox" id="select-all-updates" onclick="(this.checked?selectAllUpdates():selectNoneUpdates())" checked /> Select all
-                </label>
             </div>
-            <div id="update-filters-body" style="margin-top:8px;">
-                <div id="update-filters-failed" style="margin-bottom:8px;">
-                    <strong style="display:block;margin-bottom:6px;color:#b91c1c">Failed updates</strong>
-                    <div id="update-filters-failed-list" style="display:flex; gap:8px; flex-wrap:wrap;"></div>
-                </div>
-                <div id="update-filters-normal">
-                    <strong style="display:block;margin-bottom:6px;color:#374151">Other updates</strong>
-                    <div id="update-filters-normal-list" style="display:flex; gap:8px; flex-wrap:wrap;"></div>
+            <div class="sidebar-section" style="flex:1;overflow:hidden;display:flex;flex-direction:column;">
+                <h3>Filter Updates
+                    <label style="float:right;font-size:1.1em;text-transform:none;letter-spacing:0;font-weight:400;cursor:pointer;">
+                        <input type="checkbox" id="select-all-updates" onclick="(this.checked?selectAllUpdates():selectNoneUpdates())" checked> All
+                    </label>
+                </h3>
+                <div id="update-filters-body" class="update-filter-list" style="flex:1;overflow-y:auto;">
+                    <div id="update-filters-failed-list"></div>
+                    <div id="update-filters-normal-list" style="margin-top:6px;"></div>
                 </div>
             </div>
+            <div class="sidebar-section" style="font-size:0.78em;color:#94a3b8;">
+                <span id="filtered-computer-count">$($computerSummary.Count)</span> / $($computerSummary.Count) computers shown
+            </div>
         </div>
-        
-        <div id="computers-container">
+
+        <div class="main-content">
+            <table class="computer-table">
+                <thead>
+                    <tr>
+                        <th></th>
+                        <th>Status</th>
+                        <th>Computer</th>
+                        <th>IP</th>
+                        <th style="text-align:center">Installed</th>
+                        <th style="text-align:center">Failed</th>
+                        <th style="text-align:center">Skipped</th>
+                        <th style="text-align:center">Total</th>
+                        <th>Reboot</th>
+                    </tr>
+                </thead>
+                <tbody id="computers-tbody">
 "@
- 
-# Add each computer's data
-foreach ($summary in $computerSummary | Sort-Object ComputerName) {
+
+# Add each computer as a table row + hidden detail row
+foreach ($summary in $computerSummary | Sort-Object @{Expression={if([int]$_.Failed -gt 0){0}elseif($_.Status -in @('Incomplete','CollectionFailed','Ignored-WSMAN','JobStartFailed')){1}else{2}}}, ComputerName) {
     $computerName = $summary.ComputerName
     $group = $computerGroups | Where-Object { $_.Name -eq $computerName }
     $computerData = if ($group) { $group.Group } else { @() }
-    
+
     $cleanName = $computerName -replace '[^a-zA-Z0-9]', '_'
     $safeComputerName = ConvertTo-HtmlEncoded $computerName
-    $hasFailures = $summary.Failed -gt 0
-    $isUnreachable = $summary.Status -eq "Ignored-WSMAN" -or $summary.Status -eq "Incomplete" -or $summary.Status -eq "CollectionFailed"
+    $hasFailures = [int]$summary.Failed -gt 0
+    $isUnreachable = $summary.Status -in @("Ignored-WSMAN", "Incomplete", "CollectionFailed", "JobStartFailed")
+
     $statusBadge = switch ($summary.Status) {
-        "Completed" { "✅" }
-        "NoUpdatesNeeded" { "✔" }
-        "Failed" { "❌" }
-        "Incomplete" { "⏱️" }
-        "Ignored-WSMAN" { "🚫" }
-        "CollectionFailed" { "⚠️" }
-        default { "❓" }
+        "Completed"        { '<span class="badge-sm status-ok">Completed</span>' }
+        "NoUpdatesNeeded"  { '<span class="badge-sm status-skip">Up to Date</span>' }
+        "Incomplete"       { '<span class="badge-sm status-warn">Incomplete</span>' }
+        "Ignored-WSMAN"    { '<span class="badge-sm status-fail">Unreachable</span>' }
+        "CollectionFailed" { '<span class="badge-sm status-fail">Collection Failed</span>' }
+        "JobStartFailed"   { '<span class="badge-sm status-fail">Job Failed</span>' }
+        default            { "<span class=`"badge-sm status-warn`">$($summary.Status)</span>" }
     }
-    
+
+    $rowClass = "computer-row"
+    if ($hasFailures) { $rowClass += " has-failures" }
+    if ($isUnreachable) { $rowClass += " unreachable" }
+
+    $rebootBadge = if ($summary.RebootRequired -eq $true -or $summary.RebootRequired -eq "True") {
+        '<span class="badge-sm reboot">Yes</span>'
+    } else { "" }
+
+    $installedCount = if ([int]$summary.Installed -gt 0) { $summary.Installed } else { "-" }
+    $failedCount = if ([int]$summary.Failed -gt 0) { $summary.Failed } else { "-" }
+    $skippedCount = if ([int]$summary.Skipped -gt 0) { $summary.Skipped } else { "-" }
+    $totalCount = if ([int]$summary.TotalUpdates -gt 0) { $summary.TotalUpdates } else { "-" }
+
     $html += @"
-            <div class="computer-card$(if($hasFailures){' has-failures'})$(if($isUnreachable){' unreachable'})" data-computer="$computerName" data-status="$($summary.Status)" id="computer-$cleanName">
-                <div class="computer-header$(if($hasFailures){' has-failures'})$(if($isUnreachable){' unreachable'})" onclick="toggleComputer('$cleanName')">
-                    <div class="computer-info">
-                        <div>
-                            <div class="computer-name">
-                                <span>💻</span>
-                                <span>$safeComputerName</span>
-                            </div>
-                            <div class="computer-ip">$(ConvertTo-HtmlEncoded $summary.IP)</div>
-                        </div>
-                        <div class="update-summary">
-                            <span class="summary-badge badge-info">
-                                $statusBadge $($summary.Status)
-                            </span>
+                    <tr class="$rowClass" data-computer="$computerName" data-status="$($summary.Status)" id="computer-$cleanName" onclick="toggleComputer('$cleanName')">
+                        <td><span class="expand-chevron">&#9654;</span></td>
+                        <td>$statusBadge</td>
+                        <td class="computer-name-cell" title="$safeComputerName">$safeComputerName</td>
+                        <td class="ip-cell">$(ConvertTo-HtmlEncoded $summary.IP)</td>
+                        <td class="count-cell installed">$installedCount</td>
+                        <td class="count-cell failed">$failedCount</td>
+                        <td class="count-cell skipped">$skippedCount</td>
+                        <td class="count-cell" style="font-weight:400;color:#64748b;">$totalCount</td>
+                        <td>$rebootBadge</td>
+                    </tr>
+                    <tr class="detail-row" id="detail-$cleanName">
+                        <td colspan="9" style="padding:0;">
+                            <div class="detail-panel">
 "@
-    
-    if ($summary.TotalUpdates -gt 0) {
-        $html += @"
-                            <span class="summary-badge badge-info">
-                                📦 $($summary.TotalUpdates) updates
-                            </span>
-"@
+
+    if ($summary.RebootRequired -eq $true -or $summary.RebootRequired -eq "True") {
+        $html += "                                <div class=`"reboot-note`">&#9888;&#65039; This computer requires a reboot to complete update installation.</div>`n"
     }
-    
-    if ($summary.Installed -gt 0) {
-        $html += @"
-                            <span class="summary-badge badge-success">
-                                ✅ $($summary.Installed) installed
-                            </span>
-"@
-    }
-    
-    if ($summary.Failed -gt 0) {
-        $html += @"
-                            <span class="summary-badge badge-error">
-                                ❌ $($summary.Failed) failed
-                            </span>
-"@
-    }
-    
-    if ($summary.RebootRequired) {
-        $html += @"
-                            <span class="summary-badge badge-warning">
-                                ⚠️ Reboot Required
-                            </span>
-"@
-    }
-    
-    $html += @"
-                        </div>
-                    </div>
-                    <div class="expand-icon">▼</div>
-                </div>
-                <div class="computer-content" id="content-$cleanName">
-"@
-    
-    if ($summary.RebootRequired) {
-        $html += @"
-                    <div class="reboot-warning">
-                        <span style="font-size: 1.2em;">⚠️</span>
-                        <span>This computer requires a reboot to complete update installation.</span>
-                    </div>
-"@
-    }
-    
+
     if ($computerData.Count -gt 0) {
         $html += @"
-                    <table class="update-table">
-                        <thead>
-                            <tr>
-                                <th width="12%">KB Number</th>
-                                <th width="50%">Update Title</th>
-                                <th width="10%">Size</th>
-                                <th width="15%">Status</th>
-                                <th width="13%">Result Code</th>
-                            </tr>
-                        </thead>
-                        <tbody>
+                                <table class="update-table">
+                                    <thead><tr>
+                                        <th style="width:12%">KB</th>
+                                        <th style="width:52%">Update Title</th>
+                                        <th style="width:8%">Size</th>
+                                        <th style="width:14%">Status</th>
+                                        <th style="width:14%">Result</th>
+                                    </tr></thead>
+                                    <tbody>
 "@
-        
         foreach ($update in $computerData | Sort-Object KB) {
-            # Enhanced status display that properly handles text results
             $resultText = if ($update.Result) { $update.Result.ToString() } else { "" }
             $statusText = if ($update.Status) { $update.Status.ToString() } else { "" }
-            
-            # Determine display and row styling
+
             $isFailedRow = $false
-            $statusDisplay = ""
-            
-            # Check for Skipped (Defender definition updates) first
-            if ($statusText -eq "Skipped") {
-                $statusDisplay = '<span class="status-icon" style="color:#94a3b8;">&#9197; Skipped</span>'
+            $statusDisplay = switch -Regex ($statusText) {
+                "^Skipped$"  { '<span class="status-icon" style="color:#94a3b8;">&#9197; Skipped</span>'; break }
+                "^Failed$|^Aborted$" { $isFailedRow = $true; '<span class="status-icon status-failed">&#10060; ' + $statusText + '</span>'; break }
+                "^Installed$" { '<span class="status-icon status-installed">&#9989; Installed</span>'; break }
+                "^InstalledWithErrors$" { '<span class="status-icon status-warning">&#9888;&#65039; With Errors</span>'; break }
+                default { '<span class="status-icon">&#10067; ' + $statusText + '</span>' }
             }
-            # Check for failures
-            elseif ($resultText -eq "Failed" -or $statusText -eq "Failed") {
-                $statusDisplay = '<span class="status-icon status-failed">❌ Failed</span>'
-                $isFailedRow = $true
-            }
-            elseif ($resultText -eq "Installed" -or $statusText -eq "Installed") {
-                $statusDisplay = '<span class="status-icon status-installed">✅ Installed</span>'
-            }
-            elseif ($resultText -match "Abort" -or $statusText -match "Abort") {
-                $statusDisplay = '<span class="status-icon status-failed">❌ Aborted</span>'
-                $isFailedRow = $true
-            }
-            elseif ($statusText -match "Error") {
-                $statusDisplay = '<span class="status-icon status-warning">⚠️ With Errors</span>'
-            }
-            else {
-                # Default case for unknown
-                $statusDisplay = '<span class="status-icon">❓ Unknown</span>'
-                # If Result shows Failed but Status is Unknown, still mark as failed
-                if ($resultText -eq "Failed") {
-                    $isFailedRow = $true
-                }
-            }
-            
-            $kbDisplay = if ($update.KB -and $update.KB -ne "N/A") { 
-                "<span class='kb-badge'>$($update.KB)</span>" 
-            } else { 
-                "<span style='color: #94a3b8;'>-</span>" 
-            }
-            
-            # Add row with failed styling if needed
-            $rowClass = if ($isFailedRow) { ' class="failed-row"' } else { '' }
-            
-            # assign a stable key per update row (prefer KB, fallback to sanitized Title)
-            if ($update.KB -and $update.KB -ne '') {
-                $uKey = $update.KB
+
+            $kbDisplay = if ($update.KB -and $update.KB -ne "N/A" -and $update.KB -ne "") {
+                "<span class='kb-badge'>$($update.KB)</span>"
             } else {
-                $uKey = $update.Title -replace '\s+', '_' -replace '[^A-Za-z0-9_\-]', ''
+                "<span style='color:#94a3b8;'>-</span>"
             }
+
+            $rowClass = if ($isFailedRow) { ' class="failed-row"' } else { '' }
+            $uKey = if ($update.KB -and $update.KB -ne '') { $update.KB } else { $update.Title -replace '\s+', '_' -replace '[^A-Za-z0-9_\-]', '' }
             $safeTitle = ConvertTo-HtmlEncoded $update.Title
+
             $html += @"
-                            <tr$rowClass data-ukey='$uKey'>
-                                <td>$kbDisplay</td>
-                                <td>$safeTitle</td>
-                                <td>$($update.Size)</td>
-                                <td>$statusDisplay</td>
-                                <td style="text-align: center; color: $(if($isFailedRow){'#ef4444'}else{'#6b7280'});">$resultText</td>
-                            </tr>
+                                        <tr$rowClass data-ukey='$uKey'>
+                                            <td>$kbDisplay</td>
+                                            <td>$safeTitle</td>
+                                            <td>$($update.Size)</td>
+                                            <td>$statusDisplay</td>
+                                            <td style="text-align:center;color:$(if($isFailedRow){'#ef4444'}else{'#64748b'});">$resultText</td>
+                                        </tr>
 "@
         }
-        
+
         $html += @"
-                        </tbody>
-                    </table>
+                                    </tbody>
+                                </table>
 "@
     } elseif ($summary.Status -eq "NoUpdatesNeeded") {
-        $html += @"
-                    <div style="padding: 40px; text-align: center; color: #10b981;">
-                        <div style="font-size: 3em;">✅</div>
-                        <div style="font-size: 1.2em; margin-top: 10px;">System is up to date</div>
-                        <div style="color: #6b7280; margin-top: 5px;">No updates were needed on this computer</div>
-                    </div>
-"@
+        $html += "                                <div class=`"no-data`">&#9989; System is up to date &mdash; no updates needed</div>`n"
     } elseif ($summary.CollectionError) {
         $safeError = ConvertTo-HtmlEncoded $summary.CollectionError
-        $html += @"
-                    <div style="padding: 20px; color: #ef4444;">
-                        <strong>Error collecting results:</strong> $safeError
-                    </div>
-"@
+        $html += "                                <div class=`"no-data`" style=`"color:#dc2626;`">Error: $safeError</div>`n"
     } else {
-        $html += @"
-                    <div style="padding: 20px; color: #6b7280; text-align: center;">
-                        <em>No update data available</em>
-                    </div>
-"@
+        $html += "                                <div class=`"no-data`">No update data available</div>`n"
     }
-    
+
     $html += @"
-                </div>
-            </div>
+                            </div>
+                        </td>
+                    </tr>
 "@
 }
- 
+
 $html += @"
-        </div>
-        
-        <div class="footer">
-            <p style="font-size: 1.1em; margin-bottom: 10px;">Windows Update Deployment Complete</p>
-            <p style="opacity: 0.8;">Report Path: $sessionReportPath</p>
-            <p style="opacity: 0.6; font-size: 0.9em;">Generated by Windows Update Script v2.0</p>
+                </tbody>
+            </table>
         </div>
     </div>
-    
+
+    <div class="footer">
+        Windows Update Deployment Report &middot; Session $timestamp &middot; $sessionReportPath
+    </div>
+
     <script>
-        // Unique updates data (KB => Title)
         const uniqueUpdates = {
 "@
 foreach ($k in $uniqueUpdates.Keys) {
@@ -2028,342 +1493,245 @@ $null = $html += "        };`n"
 $null = $html += "        const rerunComputers = $rerunJsArray;`n"
 
 $null = $html += @"
-        // Render update filter checkboxes
+
+        function toggleAlert(header) {
+            header.classList.toggle('collapsed');
+            const body = header.nextElementSibling;
+            if (body) body.classList.toggle('collapsed');
+        }
+
+        let currentStatusFilter = 'all';
+        let sortDescending = false;
+
+        function filterByStatus(status, pill) {
+            currentStatusFilter = status;
+            document.querySelectorAll('.status-pill').forEach(p => p.classList.remove('active'));
+            if (pill) pill.classList.add('active');
+            applyFilters();
+        }
+
+        function filterComputers(searchText) {
+            applyFilters();
+        }
+
+        function applyFilters() {
+            const searchText = (document.getElementById('search-input').value || '').toLowerCase();
+            let visibleCount = 0;
+
+            document.querySelectorAll('.computer-row').forEach(row => {
+                const name = (row.getAttribute('data-computer') || '').toLowerCase();
+                const status = row.getAttribute('data-status') || '';
+                const ip = row.querySelector('.ip-cell') ? row.querySelector('.ip-cell').textContent.toLowerCase() : '';
+
+                let show = true;
+
+                // Status filter
+                if (currentStatusFilter !== 'all') {
+                    if (currentStatusFilter === 'failures') {
+                        show = row.classList.contains('has-failures');
+                    } else if (currentStatusFilter === 'unreachable') {
+                        show = row.classList.contains('unreachable');
+                    } else {
+                        show = status === currentStatusFilter;
+                    }
+                }
+
+                // Search filter
+                if (show && searchText) {
+                    show = name.includes(searchText) || ip.includes(searchText);
+                }
+
+                row.classList.toggle('hidden', !show);
+                // Also hide the detail row
+                const detailId = 'detail-' + row.id.replace('computer-', '');
+                const detail = document.getElementById(detailId);
+                if (detail && !show) {
+                    detail.classList.remove('visible');
+                    row.classList.remove('expanded');
+                }
+                if (show) visibleCount++;
+            });
+
+            const countEl = document.getElementById('filtered-computer-count');
+            if (countEl) countEl.textContent = visibleCount;
+        }
+
+        function toggleComputer(cleanName) {
+            const row = document.getElementById('computer-' + cleanName);
+            const detail = document.getElementById('detail-' + cleanName);
+            if (!row || !detail) return;
+            const isExpanded = row.classList.contains('expanded');
+            row.classList.toggle('expanded');
+            detail.classList.toggle('visible');
+            if (!isExpanded) {
+                detail.querySelector('.detail-panel').scrollTop = 0;
+            }
+        }
+
+        function expandAll() {
+            document.querySelectorAll('.computer-row:not(.hidden)').forEach(row => {
+                row.classList.add('expanded');
+                const cleanName = row.id.replace('computer-', '');
+                const detail = document.getElementById('detail-' + cleanName);
+                if (detail) detail.classList.add('visible');
+            });
+        }
+
+        function collapseAll() {
+            document.querySelectorAll('.computer-row').forEach(row => row.classList.remove('expanded'));
+            document.querySelectorAll('.detail-row').forEach(d => d.classList.remove('visible'));
+        }
+
+        function expandFailures() {
+            filterByStatus('failures', document.querySelector('.status-pill[data-filter="failures"]'));
+            document.querySelectorAll('.computer-row.has-failures:not(.hidden)').forEach(row => {
+                row.classList.add('expanded');
+                const cleanName = row.id.replace('computer-', '');
+                const detail = document.getElementById('detail-' + cleanName);
+                if (detail) detail.classList.add('visible');
+            });
+        }
+
+        function sortComputersByStatus() {
+            const tbody = document.getElementById('computers-tbody');
+            const pairs = [];
+            const rows = Array.from(tbody.children);
+            for (let i = 0; i < rows.length; i += 2) {
+                pairs.push({ row: rows[i], detail: rows[i+1] });
+            }
+            const priority = { 'Failed':1, 'JobStartFailed':2, 'CollectionFailed':3, 'Incomplete':4, 'Ignored-WSMAN':5, 'Completed':6, 'NoUpdatesNeeded':7 };
+            pairs.sort((a, b) => {
+                const as = a.row.getAttribute('data-status') || '';
+                const bs = b.row.getAttribute('data-status') || '';
+                // Sort failures-with-count first
+                const af = a.row.classList.contains('has-failures') ? 0 : 1;
+                const bf = b.row.classList.contains('has-failures') ? 0 : 1;
+                if (af !== bf) return sortDescending ? bf - af : af - bf;
+                const diff = (priority[as]||99) - (priority[bs]||99);
+                return sortDescending ? -diff : diff;
+            });
+            pairs.forEach(p => { tbody.appendChild(p.row); tbody.appendChild(p.detail); });
+            sortDescending = !sortDescending;
+        }
+
+        function scrollToComputer(cleanName) {
+            // Reset status filter to All so the target is visible
+            filterByStatus('all', document.querySelector('.status-pill[data-filter="all"]'));
+            document.getElementById('search-input').value = '';
+            applyFilters();
+
+            const row = document.getElementById('computer-' + cleanName);
+            if (row) {
+                row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                row.classList.add('expanded');
+                const detail = document.getElementById('detail-' + cleanName);
+                if (detail) detail.classList.add('visible');
+                row.style.animation = 'none';
+                setTimeout(() => { row.style.animation = 'highlightRow 1.5s ease-out'; }, 50);
+            }
+        }
+
+        // Update filter system
         function renderUpdateFilters() {
-            const container = document.getElementById('update-filters-body');
-            if (!container) return;
+            const failedList = document.getElementById('update-filters-failed-list');
+            const normalList = document.getElementById('update-filters-normal-list');
+            if (!failedList || !normalList) return;
+
             Object.keys(uniqueUpdates).forEach(key => {
-                const label = document.createElement('label');
-                label.style.display = 'inline-flex';
-                label.style.alignItems = 'center';
-                label.style.gap = '6px';
-                label.style.background = '#fff';
-                label.style.padding = '6px 10px';
-                label.style.borderRadius = '8px';
-                label.style.border = '1px solid #e5e7eb';
- 
+                const item = document.createElement('label');
+                item.className = 'update-filter-item';
+
                 const cb = document.createElement('input');
                 cb.type = 'checkbox';
-                // Auto-uncheck Defender Security Intelligence updates by default
                 const title = uniqueUpdates[key] || '';
-                const isDefender = /Security Intelligence Update for Microsoft Defender Antivirus/i.test(title);
+                const isDefender = /Security Intelligence Update for Microsoft Defender/i.test(title);
                 cb.checked = !isDefender;
                 cb.dataset.ukey = key;
                 cb.addEventListener('change', updateFiltersFromUI);
- 
+
                 const span = document.createElement('span');
-                span.textContent = uniqueUpdates[key].length > 60 ? uniqueUpdates[key].substring(0,57)+'...' : uniqueUpdates[key];
-                span.title = uniqueUpdates[key];
- 
-                label.appendChild(cb);
-                label.appendChild(span);
-                // Decide whether this update has any failed rows in the current report
-                const failedList = document.getElementById('update-filters-failed-list');
-                const normalList = document.getElementById('update-filters-normal-list');
-                const hasFailedInReport = document.querySelectorAll('tr.failed-row[data-ukey="' + key + '"]').length > 0;
-                if (hasFailedInReport && failedList) {
-                    failedList.appendChild(label);
-                } else if (normalList) {
-                    normalList.appendChild(label);
+                span.textContent = title.length > 50 ? title.substring(0,47)+'...' : title;
+                span.title = title;
+
+                item.appendChild(cb);
+                item.appendChild(span);
+
+                const hasFailed = document.querySelectorAll('tr.failed-row[data-ukey="' + key + '"]').length > 0;
+                if (hasFailed) {
+                    span.style.color = '#991b1b';
+                    failedList.appendChild(item);
                 } else {
-                    container.appendChild(label);
+                    normalList.appendChild(item);
                 }
             });
- 
-            // Update the select-all control to reflect whether all filters are checked
-            const allCheckboxes = Array.from(document.querySelectorAll('#update-filters-body input[type=checkbox]'));
-            const allChecked = allCheckboxes.length === 0 ? false : allCheckboxes.every(cb => cb.checked);
+
+            const allCbs = Array.from(document.querySelectorAll('#update-filters-body input[type=checkbox]'));
             const selectAll = document.getElementById('select-all-updates');
-            if (selectAll) selectAll.checked = allChecked;
- 
-            // Apply initial visibility based on the default checkbox state
+            if (selectAll) selectAll.checked = allCbs.every(cb => cb.checked);
             updateFiltersFromUI();
         }
- 
+
         function updateFiltersFromUI() {
-            // Build set of enabled keys
             const enabled = new Set();
             document.querySelectorAll('#update-filters-body input[type=checkbox]').forEach(cb => {
                 if (cb.checked) enabled.add(cb.dataset.ukey);
             });
 
-            // Show/hide rows
             document.querySelectorAll('tr[data-ukey]').forEach(row => {
-                const key = row.getAttribute('data-ukey');
-                if (enabled.has(key)) {
-                    row.classList.remove('hidden');
+                row.classList.toggle('hidden', !enabled.has(row.getAttribute('data-ukey')));
+            });
+
+            // Update per-computer failure indicators
+            document.querySelectorAll('.computer-row').forEach(row => {
+                const cleanName = row.id.replace('computer-', '');
+                const detail = document.getElementById('detail-' + cleanName);
+                if (!detail) return;
+                const visibleFailed = detail.querySelectorAll('tr.failed-row:not(.hidden)').length;
+                const failedCell = row.querySelector('.count-cell.failed');
+                if (failedCell) {
+                    failedCell.textContent = visibleFailed > 0 ? visibleFailed : '-';
+                }
+                if (visibleFailed > 0) {
+                    row.classList.add('has-failures');
                 } else {
-                    row.classList.add('hidden');
+                    row.classList.remove('has-failures');
                 }
             });
 
-            // Recompute per-computer failure status: if a computer has no visible failed rows, remove the has-failures class
-            // Also update the "X failed" badge in the card header to reflect only visible failures.
-            document.querySelectorAll('.computer-card').forEach(card => {
-                const header = card.querySelector('.computer-header');
-                const visibleFailedCount = card.querySelectorAll('tr.failed-row:not(.hidden)').length;
-                if (visibleFailedCount > 0) {
-                    card.classList.add('has-failures');
-                    if (header) header.classList.add('has-failures');
-                } else {
-                    card.classList.remove('has-failures');
-                    if (header) header.classList.remove('has-failures');
-                }
-
-                // Update (or hide) the "X failed" badge in the header
-                const failedBadge = card.querySelector('.update-summary .badge-error');
-                if (failedBadge) {
-                    if (visibleFailedCount > 0) {
-                        failedBadge.classList.remove('hidden');
-                        failedBadge.innerHTML = '&#10060; ' + visibleFailedCount + ' failed';
-                    } else {
-                        failedBadge.classList.add('hidden');
-                    }
-                }
-            });
-
-            // Hide computers that don't have any visible (non-hidden) rows
-            let visibleComputerCount = 0;
-            document.querySelectorAll('.computer-card').forEach(card => {
-                const visibleRows = card.querySelectorAll('tr[data-ukey]:not(.hidden)').length > 0;
-                if (visibleRows) {
-                    card.classList.remove('hidden');
-                    visibleComputerCount++;
-                } else {
-                    card.classList.add('hidden');
-                }
-            });
-            
-            // Update the filtered computer count
-            const countDisplay = document.getElementById('filtered-computer-count');
-            if (countDisplay) {
-                countDisplay.textContent = visibleComputerCount;
-            }
-
-            // Update the top failure alert list to reflect current visible failed rows
-            updateFailureAlertFromFilters();
-
-            // Sync top stat cards with the filtered view
-            const totalVisibleFailed  = document.querySelectorAll('tr.failed-row:not(.hidden)').length;
+            // Update top stats
+            const totalVisibleFailed = document.querySelectorAll('tr.failed-row:not(.hidden)').length;
             const totalVisibleUpdates = document.querySelectorAll('tr[data-ukey]:not(.hidden)').length;
-            const statFailed = document.getElementById('stat-failed-value');
-            const statTotal  = document.getElementById('stat-total-value');
-            if (statFailed) statFailed.textContent = totalVisibleFailed;
-            if (statTotal)  statTotal.textContent  = totalVisibleUpdates;
-        }
-        
-        function updateFailureAlertFromFilters() {
-            // For each failure-item in the top alert, recalculate how many visible failed rows exist for that computer
-            document.querySelectorAll('.failure-alert .failure-item').forEach(item => {
-                const compId = item.getAttribute('data-computer');
-                if (!compId) return;
-                // match rows in the report for that computer that are failed and visible
-                const visibleFailedRows = document.querySelectorAll('#computer-' + compId + ' tr.failed-row:not(.hidden)').length;
-                const numberSpan = item.querySelector('.failure-count-number');
-                if (visibleFailedRows > 0) {
-                    item.classList.remove('hidden');
-                    if (numberSpan) numberSpan.textContent = visibleFailedRows;
+            const sf = document.getElementById('stat-failed-value');
+            const st = document.getElementById('stat-total-value');
+            if (sf) sf.textContent = totalVisibleFailed;
+            if (st) st.textContent = totalVisibleUpdates;
+
+            // Update failure alert chips
+            document.querySelectorAll('.alert-chip.fail').forEach(chip => {
+                const compId = chip.getAttribute('data-computer');
+                const detail = document.getElementById('detail-' + compId);
+                if (!detail) return;
+                const cnt = detail.querySelectorAll('tr.failed-row:not(.hidden)').length;
+                const numSpan = chip.querySelector('.failure-count-number');
+                if (cnt > 0) {
+                    chip.classList.remove('hidden');
+                    if (numSpan) numSpan.textContent = cnt;
                 } else {
-                    // hide the failure item if there are no visible failed rows after filtering
-                    item.classList.add('hidden');
+                    chip.classList.add('hidden');
                 }
             });
-            // Also update the summary count in the alert subtitle
-            const visibleFailureItems = document.querySelectorAll('.failure-alert .failure-item:not(.hidden)').length;
-            const subtitle = document.querySelector('.failure-alert-subtitle');
-            if (subtitle) {
-                if (visibleFailureItems === 1) subtitle.textContent = '1 computer requires attention';
-                else subtitle.textContent = visibleFailureItems + ' computers require attention';
-            }
-            
-            // Update connection failure count (always visible, not filtered by updates)
-            const unreachableComputers = document.querySelectorAll('.computer-card.unreachable:not(.hidden)').length;
-            const connFailureCount = document.getElementById('connection-failure-count');
-            if (connFailureCount) {
-                connFailureCount.textContent = unreachableComputers;
-            }
         }
- 
+
         function selectAllUpdates() {
             document.querySelectorAll('#update-filters-body input[type=checkbox]').forEach(cb => cb.checked = true);
             document.getElementById('select-all-updates').checked = true;
             updateFiltersFromUI();
         }
- 
+
         function selectNoneUpdates() {
             document.querySelectorAll('#update-filters-body input[type=checkbox]').forEach(cb => cb.checked = false);
             document.getElementById('select-all-updates').checked = false;
             updateFiltersFromUI();
-        }
- 
-        function toggleComputer(computerName) {
-            const header = event.currentTarget;
-            const content = document.getElementById('content-' + computerName);
- 
-            header.classList.toggle('expanded');
-            content.classList.toggle('expanded');
- 
-            // When opening, ensure the content area is scrolled to top
-            if (content.classList.contains('expanded')) {
-                content.scrollTop = 0;
-            }
-        }
-        
-        function expandAll() {
-            document.querySelectorAll('.computer-header').forEach(header => {
-                header.classList.add('expanded');
-            });
-            document.querySelectorAll('.computer-content').forEach(content => {
-                content.classList.add('expanded');
-                // reset scroll so tables start at top
-                content.scrollTop = 0;
-            });
-        }
-        
-        function collapseAll() {
-            document.querySelectorAll('.computer-header').forEach(header => {
-                header.classList.remove('expanded');
-            });
-            document.querySelectorAll('.computer-content').forEach(content => {
-                content.classList.remove('expanded');
-                // reset scroll position to top so next open shows top
-                content.scrollTop = 0;
-            });
-            // remove any hidden filter when collapsing
-            document.querySelectorAll('.computer-card').forEach(card => card.classList.remove('hidden'));
-        }
-        
-        function expandFailures() {
-            // First collapse all
-            collapseAll();
-            
-            // Hide computers without failures
-            document.querySelectorAll('.computer-card').forEach(card => {
-                if (!card.classList.contains('has-failures')) {
-                    card.classList.add('hidden');
-                } else {
-                    card.classList.remove('hidden');
-                    // Expand the ones with failures
-                    const cleanName = card.id.replace('computer-', '');
-                    const header = card.querySelector('.computer-header');
-                    const content = document.getElementById('content-' + cleanName);
-                    if (header && content) {
-                        header.classList.add('expanded');
-                        content.classList.add('expanded');
-                        content.scrollTop = 0;
-                    }
-                }
-            });
-        }
-        
-        function scrollToComputer(computerName) {
-            // Show all computers first (in case they're filtered)
-            document.querySelectorAll('.computer-card').forEach(card => {
-                card.classList.remove('hidden');
-            });
-            
-            // Find the computer card
-            const computerCard = document.getElementById('computer-' + computerName);
-            if (computerCard) {
-                // Scroll to it
-                computerCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                
-                // Expand it
-                const header = computerCard.querySelector('.computer-header');
-                const content = document.getElementById('content-' + computerName);
-                if (header && content) {
-                    header.classList.add('expanded');
-                    content.classList.add('expanded');
-                    // Ensure the content scroll starts at the top
-                    content.scrollTop = 0;
- 
-                    // Add a highlight animation
-                    computerCard.style.animation = 'none';
-                    setTimeout(() => {
-                        computerCard.style.animation = 'highlightCard 1.5s ease-out';
-                    }, 100);
-                }
-            }
-        }
-        
-        function filterComputers(searchText) {
-            const searchLower = searchText.toLowerCase();
-            const cards = document.querySelectorAll('.computer-card');
-            
-            cards.forEach(card => {
-                const computerName = card.getAttribute('data-computer').toLowerCase();
-                const content = card.textContent.toLowerCase();
-                
-                if (searchText === '' || computerName.includes(searchLower) || content.includes(searchLower)) {
-                    card.classList.remove('hidden');
-                } else {
-                    card.classList.add('hidden');
-                }
-            });
-        }
-        
-        // Add highlight animation style
-        const style = document.createElement('style');
-        style.textContent = '@keyframes highlightCard { 0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); } 50% { box-shadow: 0 0 30px 10px rgba(239, 68, 68, 0.3); } 100% { box-shadow: 0 10px 25px rgba(0,0,0,0.1); } }';
-        document.head.appendChild(style);
-        
-        // Animate elements on load
-        document.addEventListener('DOMContentLoaded', function() {
-            const cards = document.querySelectorAll('.computer-card');
-            cards.forEach((card, index) => {
-                card.style.animationDelay = (index * 0.1) + 's';
-            });
-            
-            const statCards = document.querySelectorAll('.stat-card');
-            statCards.forEach((card, index) => {
-                card.style.animationDelay = (index * 0.1) + 's';
-            });
-            // render update filters and apply default visibility
-            renderUpdateFilters();
-            updateFiltersFromUI();
-
-            // Show re-run banner if there are candidates
-            if (rerunComputers.length > 0) {
-                const banner = document.getElementById('rerun-banner');
-                if (banner) banner.style.display = '';
-                const cnt = document.getElementById('rerun-count');
-                if (cnt) cnt.textContent = rerunComputers.length;
-                const detail = document.getElementById('rerun-detail');
-                if (detail) detail.textContent = rerunComputers.map(c => c.name + ' (' + c.reason + ')').join('  \u2022  ');
-            }
-        });
- 
-        // Sort toggle state
-        let sortDescending = false;
- 
-        // Map statuses to a priority number for sorting (lower = higher priority)
-        function statusPriority(status) {
-            const map = {
-                'Failed': 1,
-                'Incomplete': 2,
-                'NoUpdatesNeeded': 3,
-                'Completed': 4,
-                'Unknown': 5
-            };
-            return map[status] || 99;
-        }
- 
-        function sortComputersByStatus() {
-            const container = document.getElementById('computers-container');
-            const cards = Array.from(container.querySelectorAll('.computer-card'));
- 
-            cards.sort((a, b) => {
-                const aStatus = a.getAttribute('data-status') || 'Unknown';
-                const bStatus = b.getAttribute('data-status') || 'Unknown';
-                const diff = statusPriority(aStatus) - statusPriority(bStatus);
-                return sortDescending ? -diff : diff;
-            });
- 
-            // Re-append in new order
-            cards.forEach(card => container.appendChild(card));
- 
-            // Toggle ordering for next click
-            sortDescending = !sortDescending;
         }
 
         function downloadRerunCSV() {
@@ -2375,19 +1743,31 @@ $null = $html += @"
             a.download = 'rerun_computers.csv';
             a.click();
         }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            renderUpdateFilters();
+
+            if (rerunComputers.length > 0) {
+                const banner = document.getElementById('rerun-banner');
+                if (banner) banner.style.display = '';
+                const cnt = document.getElementById('rerun-count');
+                if (cnt) cnt.textContent = rerunComputers.length;
+                const detail = document.getElementById('rerun-detail');
+                if (detail) detail.textContent = rerunComputers.map(c => c.name + ' (' + c.reason + ')').join('  \u2022  ');
+            }
+        });
     </script>
-</script>
 </body>
 </html>
 "@
- 
+
 # Save HTML report
 $htmlPath = "$sessionReportPath\WindowsUpdateReport.html"
 $html | Out-File $htmlPath -Encoding UTF8
 # ============================================
 # FINAL SUMMARY
 # ============================================
- 
+
 Write-Host "`n" -NoNewline
 Write-Host "╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Green
 Write-Host "║                    DEPLOYMENT COMPLETE                       ║" -ForegroundColor Green
