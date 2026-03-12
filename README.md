@@ -118,12 +118,13 @@ flowchart TD
 
     subgraph P3 [Phase 3: Collect & Verify Results]
         direction TB
-        P3a[Open PSSession\nper computer] --> P3b[Copy updatelog.csv\nfrom remote]
-        P3b --> P3val[Validate CSV schema]
+        P3a[Batch create PSSessions\nto all completed machines] --> P3b[Single Invoke-Command\nacross all sessions]
+        P3b --> P3b2[Read CSV + hotfixes +\npending + reboot in one call]
+        P3b2 --> P3val[Validate CSV schema]
         P3val --> P3c[Parse update results\ntext + numeric codes]
         P3c --> P3v[Verify installs via\nGet-HotFix + WU API]
         P3v --> P3corr[Auto-correct false\nfailures if verified]
-        P3corr --> P3r[Check reboot status\nvia registry keys]
+        P3corr --> P3r[Reboot status from\nregistry data]
         P3r --> P3d[Build per-computer\nsummary]
         P3d --> P3e[Generate rerun CSV\nfor failures]
     end
@@ -175,6 +176,13 @@ The script doesn't just trust PSWindowsUpdate's output. After collecting results
 - Updates verified as installed show a green checkmark; unverified show red X
 - Updates pending reboot may show as "Pending" until the machine restarts
 - Driver and non-KB updates show as "N/A" (cannot be verified via hotfix lookup)
+
+### Batched Collection (Phase 3 Performance)
+Phase 3 uses batched operations for fast collection across large fleets:
+1. **Batch session creation** — `New-PSSession` with all IPs at once (parallel under the hood)
+2. **Single Invoke-Command** — One call fans out to all sessions simultaneously, reading CSV content, hotfixes, pending updates, and reboot status in a single round-trip
+3. **No file copy** — CSV content is read directly on the remote machine and returned as string data, eliminating SMB copy overhead
+4. **Local processing** — All parsing, deduplication, and verification cross-referencing happens locally (fast)
 
 ## Troubleshooting
 
