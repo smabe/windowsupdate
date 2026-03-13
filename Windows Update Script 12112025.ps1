@@ -1433,21 +1433,22 @@ $html = @"
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            background: #f0f2f5; min-height: 100vh;
+            background: #f0f2f5; height: 100vh; display: flex; flex-direction: column; overflow: hidden;
         }
         /* Top bar */
         .topbar {
             background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
-            color: white; padding: 16px 24px;
+            color: white; padding: 16px 24px; flex-shrink: 0;
             display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;
         }
         .topbar h1 { font-size: 1.4em; font-weight: 600; display: flex; align-items: center; gap: 10px; }
         .topbar-meta { font-size: 0.8em; opacity: 0.7; }
         /* Stats strip */
         .stats-strip {
-            display: flex; flex-wrap: wrap; gap: 0; background: white;
+            display: flex; flex-wrap: wrap; gap: 0; background: white; flex-shrink: 0;
             border-bottom: 1px solid #e2e8f0; box-shadow: 0 1px 3px rgba(0,0,0,0.06);
         }
+        .alerts-container { flex-shrink: 0; }
         .stat-item {
             flex: 1; min-width: 120px; padding: 14px 20px; text-align: center;
             border-right: 1px solid #e2e8f0; transition: background 0.2s;
@@ -1491,10 +1492,10 @@ $html = @"
         .alert-chip.conn { background: white; border: 1px solid #e9d5ff; color: #86198f; }
         .alert-chip .chip-count { background: #ef4444; color: white; padding: 1px 7px; border-radius: 10px; font-weight: 700; font-size: 0.85em; }
         /* Dashboard layout */
-        .dashboard { display: flex; height: calc(100vh - 200px); min-height: 500px; }
+        .dashboard { display: flex; flex: 1; min-height: 0; }
         .sidebar {
             width: 240px; flex-shrink: 0; background: white; border-right: 1px solid #e2e8f0;
-            display: flex; flex-direction: column; overflow-y: auto;
+            display: flex; flex-direction: column;
         }
         .sidebar-section { padding: 14px 16px; border-bottom: 1px solid #f1f5f9; }
         .sidebar-section h3 { font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.5px; color: #94a3b8; margin-bottom: 8px; }
@@ -1607,8 +1608,10 @@ $html = @"
         @keyframes highlightRow { 0% { box-shadow: inset 0 0 0 2px #3b82f6; } 100% { box-shadow: none; } }
         /* Responsive */
         @media (max-width: 900px) {
-            .dashboard { flex-direction: column; height: auto; }
-            .sidebar { width: 100%; max-height: 300px; border-right: none; border-bottom: 1px solid #e2e8f0; }
+            body { height: auto; overflow: auto; }
+            .dashboard { flex-direction: column; flex: none; height: auto; }
+            .sidebar { width: 100%; max-height: 300px; border-right: none; border-bottom: 1px solid #e2e8f0; overflow-y: auto; }
+            .main-content { overflow: visible; }
             .stats-strip { flex-wrap: wrap; }
             .stat-item { min-width: 100px; }
         }
@@ -1633,6 +1636,8 @@ $html = @"
         <div class="stat-item $(if ($verifiableCount -gt 0 -and $verifiedCount -eq $verifiableCount) {'green'} elseif ($verifiedCount -gt 0) {'blue'} else {'gray'})"><div class="stat-value">$verifiedCount / $verifiableCount</div><div class="stat-label">Verified</div></div>
     </div>
 "@
+
+$html += "`n    <div class=`"alerts-container`">"
 
 # Alert banners
 if ($computersWithFailures.Count -gt 0) {
@@ -1718,6 +1723,7 @@ $html += @"
             <span class="toggle-icon">&#9660;</span>
         </div>
         <div class="alert-body" id="rerun-detail" style="font-size:0.85em;color:#92400e;"></div>
+    </div>
     </div>
 
     <div class="dashboard">
