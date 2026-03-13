@@ -710,6 +710,12 @@ Write-Host ""
  
 # Load and validate computers
 $computers = Import-Csv $CSVPath
+# Trim whitespace from all fields (trailing spaces in IP/Name cause silent WinRM failures)
+$computers | ForEach-Object {
+    foreach ($prop in $_.PSObject.Properties) {
+        if ($prop.Value -is [string]) { $prop.Value = $prop.Value.Trim() }
+    }
+}
 if (-not $computers -or $computers.Count -eq 0) {
     Write-Host "CSV file is empty or contains no rows. Exiting..." -ForegroundColor Red
     exit
