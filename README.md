@@ -218,3 +218,80 @@ Phase 3 uses batched operations for fast collection across large fleets:
 | Second run shows stale results | Fixed — script now removes existing PSWindowsUpdate scheduled tasks before starting new jobs |
 | "Rerun" badge on computers | Previous run logs were archived; expand the detail row to see the diff |
 | Old archives on remote machines | Archives from previous days are automatically cleaned up; same-day archives are preserved |
+
+---
+
+## Vulnerability Scan Correlation Script
+
+`Compare-VulnScanToUpdates.ps1` correlates a Qualys vulnerability scan report (XLSX) with the `all_updates.csv` output from the deployment script to determine which vulnerabilities have been remediated.
+
+### Usage
+
+```powershell
+# Basic usage — match by IP address
+.\Compare-VulnScanToUpdates.ps1 -VulnReportPath ".\scan_report.xlsx" -UpdatesCsvPath ".\Session_20260312\all_updates.csv"
+
+# Include data from previous deployment runs (previous_updatelog_*.csv files)
+.\Compare-VulnScanToUpdates.ps1 -VulnReportPath ".\scan_report.xlsx" -UpdatesCsvPath ".\Session_20260312\all_updates.csv" -IncludePreviousLogs
+
+# Also export a CSV alongside the XLSX report
+.\Compare-VulnScanToUpdates.ps1 -VulnReportPath ".\scan_report.xlsx" -UpdatesCsvPath ".\all_updates.csv" -ExportCsv
+
+# Use NetBIOS instead of DNS for hostname display
+.\Compare-VulnScanToUpdates.ps1 -VulnReportPath ".\scan_report.xlsx" -UpdatesCsvPath ".\all_updates.csv" -HostnameColumn NetBIOS
+```
+
+### How It Works
+
+1. **Reads all_updates.csv** — builds an IP+KB lookup table and tracks installed cumulative updates (parsed from the Title column, e.g., `"2026-03 Security Update (KB5079473)"`)
+2. **Incorporates previous logs** (with `-IncludePreviousLogs`) — reads `previous_updatelog_*.csv` files from the session directory and uses `computer_summary.csv` for Name→IP mapping
+3. **Reads Qualys XLSX** (via Excel COM, two-pass):
+   - **Pass 1**: Reads all rows and builds a global KB→date map — if KB5077212 has "February 2026" context in any row, that date applies to all rows referencing KB5077212
+   - **Pass 2**: Correlates each vulnerability against installed updates
+4. **Matches per host** — for each vulnerability, checks if required KBs were installed:
+   - **Exact match**: KB found in lookup with Status = "Installed" → `Remediated`
+   - **Cumulative supersession**: KB not found, but host has a newer cumulative update (by YYYY-MM date) → `Remediated (Cumulative)`
+   - **Not found**: KB missing and no covering cumulative → `Not Remediated`
+   - **No KB info**: Vulnerability has no KB reference (EOL OS, app-level) → `Manual Review`
+
+### Cumulative Update Logic
+
+Windows cumulative updates supersede all prior monthly patches. The script uses a two-pass approach:
+
+1. **Global KB date map**: All Qualys entries are scanned first to build a KB→date mapping. Date context is extracted from vulnerability titles (e.g., "Security Update for January 2026"), Results column (YYYY-MM patterns), and Solution column. This ensures that even entries without explicit dates benefit from date information found elsewhere for the same KB.
+
+2. **Supersession check**: For each missing KB, if the host has an installed cumulative update from the same product family (Windows, .NET, Other) with a month >= the missing KB's month, the vulnerability is marked `Remediated (Cumulative)`.
+
+### Output
+
+4-sheet XLSX report:
+| Sheet | Contents |
+|---|---|
+| **Host Summary** | Per-host totals, % remediated (color-coded), latest cumulative installed |
+| **Vulnerability Detail** | Every vulnerability with remediation status, required KBs, and match details |
+| **Unmatched Hosts** | Hosts in one dataset but not the other (data quality check) |
+| **Cumulative Coverage** | All cumulative updates detected per host with product family and date |
+
+### Expected Qualys XLSX Columns
+
+| Column Index | Field | Usage |
+|---|---|---|
+| 1 | IP | Primary match key |
+| 3 | DNS | Hostname display (default) |
+| 4 | NetBIOS | Fallback hostname (or primary with `-HostnameColumn NetBIOS`) |
+| 9 | Title | Vulnerability name, month name date extraction |
+| 12 | Severity | Severity rating |
+| 21 | CVE | CVE identifier(s) |
+| 26 | Solution | Secondary KB source, YYYY-MM date extraction |
+| 29 | Results | Primary KB source — `Missing Patch/KB: KBxxxxxxx` pattern, YYYY-MM date extraction |
+
+### "No Scan Results" Host Detection
+
+The Qualys XLSX often includes summary rows at the bottom listing hosts that returned no vulnerability data. These rows have comma-separated IPs in column A and text like "No results available for these hosts" or "No vulnerabilities match the search criteria" in column F. The script detects these rows during Pass 1 and includes them in the Unmatched Hosts sheet with the reason text, so you can see which hosts Qualys couldn't scan and follow up accordingly.
+
+### Known Limitations
+
+- **IP address space mismatch**: Qualys external scans use public IPs while the deployment script uses internal IPs — hosts scanned externally won't match. The Unmatched Hosts sheet reports these.
+- Cumulative supersession relies on date heuristics — if no date context is available for a missing KB (even across all Qualys entries), exact matching is used
+- Requires Excel COM (Excel must be installed on the machine running the script)
+- Requires PowerShell 7+ (uses `if` as expression syntax)
