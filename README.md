@@ -17,7 +17,7 @@ Parallel Windows Update deployment tool for rolling out updates to remote comput
 - **Post-install verification** — Cross-references PSWindowsUpdate results against `Get-HotFix` and Windows Update API to confirm updates actually installed
 - **Auto-correction** — Reclassifies false failures when verification proves an update installed successfully
 - **Accurate reboot detection** — Checks actual registry reboot-pending keys instead of assuming all machines need reboot
-- **Interactive HTML report** — Dashboard with stats, verification indicators, failure/discrepancy alerts, sidebar filters, expandable computer table, search, and sort
+- **Interactive HTML report** — Dashboard with sticky header (stats, alerts pinned at top), static sidebar filters, scrollable computer table with sticky column headers, expandable detail rows, search, and sort
 - **Report-only mode** — Regenerate the HTML report from existing session data without re-running deployment
 - **Console preservation** — Phase 2 monitoring uses cursor repositioning instead of Clear-Host, keeping Phase 1 output and errors visible
 - **Re-run CSV** — Automatically generates a CSV of failed/unreachable/inconclusive machines for easy re-execution
