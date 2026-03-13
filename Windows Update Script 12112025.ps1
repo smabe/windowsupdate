@@ -29,10 +29,6 @@ param(
     [Parameter(Mandatory=$false)]
     [int]$MaxRetries = 2,
 
-    # Seconds to wait for WSMan TCP reachability before marking a host unreachable
-    [Parameter(Mandatory=$false)]
-    [int]$WSManTimeoutSeconds = 10,
-
     # Maximum number of concurrent Phase 1 job-start operations
     [Parameter(Mandatory=$false)]
     [int]$ThrottleLimit = 50,
@@ -45,6 +41,17 @@ param(
     [string]$SessionPath
 )
  
+# ── Helper: Test WinRM reachability using Test-WSMan (more reliable than raw TCP) ──
+function Test-S2WinRM {
+    param([string]$ComputerName)
+    try {
+        $null = Test-WSMan -ComputerName $ComputerName -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 if ($ReportOnly) {
     # ============================================
     # REPORT-ONLY MODE: Load existing session data
@@ -204,10 +211,6 @@ function Wait-ForUpdateJobs {
         [Parameter(Mandatory=$false)]
         [int]$MaxRetries = 2,
 
-        # Seconds to wait for TCP WinRM port before marking a host unreachable
-        [Parameter(Mandatory=$false)]
-        [int]$WSManTimeoutSeconds = 10,
-
         # Computers that failed Phase 1 — checked every 3rd iteration for late arrival
         [Parameter(Mandatory=$false)]
         [object[]]$LateArrivals = @(),
@@ -244,18 +247,10 @@ function Wait-ForUpdateJobs {
     }
  
     # ── WSMan pre-check ──────────────────────────────────────────────────────────
-    # Fast TCP connect to port 5985 with configurable timeout avoids long DNS/network
-    # hangs that Test-WSMan alone would cause on truly unreachable hosts.
-    Write-Host "Running WSMan connectivity check against $($Computers.Count) computers (timeout: ${WSManTimeoutSeconds}s)..." -ForegroundColor Cyan
+    Write-Host "Running WSMan connectivity check against $($Computers.Count) computers..." -ForegroundColor Cyan
     foreach ($computer in $Computers) {
         $target = if ($computer.IP) { $computer.IP } else { $computer.Name }
-        $reachable = $false
-        try {
-            $tcp = New-Object System.Net.Sockets.TcpClient
-            $asyncResult = $tcp.BeginConnect($target, 5985, $null, $null)
-            $reachable = $asyncResult.AsyncWaitHandle.WaitOne($WSManTimeoutSeconds * 1000, $false) -and $tcp.Connected
-            $tcp.Close()
-        } catch { $reachable = $false }
+        $reachable = Test-S2WinRM -ComputerName $target
 
         if (-not $reachable) {
             Write-Host "  ⚠️  $($computer.Name): Not reachable on WinRM port — will be skipped" -ForegroundColor Yellow
@@ -320,14 +315,8 @@ function Wait-ForUpdateJobs {
                     $toRemove.Add($la) | Out-Null  # give up — will stay as JobStartFailed
                     continue
                 }
-                # Quick TCP check
-                $laReachable = $false
-                try {
-                    $tcp = New-Object System.Net.Sockets.TcpClient
-                    $ar = $tcp.BeginConnect($la.IP, 5985, $null, $null)
-                    $laReachable = $ar.AsyncWaitHandle.WaitOne($WSManTimeoutSeconds * 1000, $false) -and $tcp.Connected
-                    $tcp.Close()
-                } catch {}
+                # Quick WinRM check
+                $laReachable = Test-S2WinRM -ComputerName $la.IP
 
                 if ($laReachable) {
                     Write-Host "  🔁 $($la.Name): Now reachable — starting job (late arrival)" -ForegroundColor Magenta
@@ -359,16 +348,9 @@ function Wait-ForUpdateJobs {
                 continue
             }
             
-            # ── Quick TCP pre-check to avoid expensive Invoke-Command on offline machines ──
+            # ── Quick WinRM pre-check to avoid expensive Invoke-Command on offline machines ──
             $target = if ($computer.IP) { $computer.IP } else { $computer.Name }
-            $tcpReachable = $false
-            try {
-                $tcp = New-Object System.Net.Sockets.TcpClient
-                $ar = $tcp.BeginConnect($target, 5985, $null, $null)
-                $tcpReachable = $ar.AsyncWaitHandle.WaitOne($WSManTimeoutSeconds * 1000, $false) -and $tcp.Connected
-                $tcp.Close()
-            } catch {}
-            if (-not $tcpReachable) {
+            if (-not (Test-S2WinRM -ComputerName $target)) {
                 $computerStatus[$computer.Name] = "Unreachable"
                 $stillRunning++
                 continue
@@ -640,12 +622,8 @@ foreach ($testTarget in $computers) {
     $credTestCount++
     $target = if ($testTarget.IP) { $testTarget.IP } else { $testTarget.Name }
     try {
-        # Quick TCP check first
-        $tcp = New-Object System.Net.Sockets.TcpClient
-        $ar = $tcp.BeginConnect($target, 5985, $null, $null)
-        $tcpOk = $ar.AsyncWaitHandle.WaitOne($WSManTimeoutSeconds * 1000, $false) -and $tcp.Connected
-        $tcp.Close()
-        if (-not $tcpOk) { continue }
+        # Quick WinRM check first
+        if (-not (Test-S2WinRM -ComputerName $target)) { continue }
 
         Invoke-Command -ComputerName $target -Credential $cred -ScriptBlock { $env:COMPUTERNAME } -ErrorAction Stop | Out-Null
         Write-Host "  Credentials validated against $($testTarget.Name)" -ForegroundColor Green
@@ -744,20 +722,17 @@ $jobResults = $computers | ForEach-Object -Parallel {
     $rtPath        = $using:RemoteTempPath   # capture for use inside Invoke-Command
     $jobBlock      = [scriptblock]::Create($using:jobStartBlockStr)
 
-    # Pre-flight: quick TCP check on WinRM port before attempting full Invoke-Command.
-    # Saves ~20s per offline machine (avoids the full WinRM connection timeout).
+    # Pre-flight: WinRM check before attempting full Invoke-Command.
     $target = if ($IP) { $IP } else { $site }
     $preFlightOk = $false
     try {
-        $tcp = New-Object System.Net.Sockets.TcpClient
-        $ar  = $tcp.BeginConnect($target, 5985, $null, $null)
-        $preFlightOk = $ar.AsyncWaitHandle.WaitOne(($using:WSManTimeoutSeconds) * 1000, $false) -and $tcp.Connected
-        $tcp.Close()
+        $null = Test-WSMan -ComputerName $target -ErrorAction Stop
+        $preFlightOk = $true
     } catch {}
 
     if (-not $preFlightOk) {
-        Write-Host "  [$site] Not reachable on port 5985 — skipping" -ForegroundColor DarkYellow
-        return [PSCustomObject]@{ Site = $site; IP = $IP; Status = "Unreachable-PreFlight"; Error = "TCP 5985 not reachable" }
+        Write-Host "  [$site] WinRM not reachable — skipping" -ForegroundColor DarkYellow
+        return [PSCustomObject]@{ Site = $site; IP = $IP; Status = "Unreachable-PreFlight"; Error = "WinRM not reachable" }
     }
 
     try {
@@ -810,7 +785,6 @@ $monitoringResults = Wait-ForUpdateJobs -Computers $computersToMonitor -Credenti
                                         -RemoteTempPath $RemoteTempPath `
                                         -LogStabilitySeconds $LogStabilitySeconds `
                                         -MaxRetries $MaxRetries `
-                                        -WSManTimeoutSeconds $WSManTimeoutSeconds `
                                         -LateArrivals $lateArrivalComputers `
                                         -JobStartScript $jobStartBlock
 
