@@ -5,6 +5,7 @@ Parallel Windows Update deployment tool for rolling out updates to remote comput
 ## Features
 
 - **Parallel deployment** — Updates all target machines simultaneously (PowerShell 7 `ForEach-Object -Parallel`, throttled)
+- **Credential Manager** — Saves credentials to Windows Credential Manager (native P/Invoke) so you only enter them once
 - **Credential pre-validation** — Tests credentials against first reachable machine before launching parallel jobs
 - **Smart monitoring** — Detects completion via marker files, scheduled task state, WU job status, process detection (TrustedInstaller, msiexec, wusa), and log stability heuristics
 - **Late-arrival retries** — Machines that were offline during Phase 1 are automatically picked up when they come online
@@ -18,6 +19,7 @@ Parallel Windows Update deployment tool for rolling out updates to remote comput
 - **Accurate reboot detection** — Checks actual registry reboot-pending keys instead of assuming all machines need reboot
 - **Interactive HTML report** — Dashboard with stats, verification indicators, failure/discrepancy alerts, sidebar filters, expandable computer table, search, and sort
 - **Report-only mode** — Regenerate the HTML report from existing session data without re-running deployment
+- **Console preservation** — Phase 2 monitoring uses cursor repositioning instead of Clear-Host, keeping Phase 1 output and errors visible
 - **Re-run CSV** — Automatically generates a CSV of failed/unreachable/inconclusive machines for easy re-execution
 
 ## Prerequisites
@@ -50,6 +52,15 @@ Site-PC-03,10.0.2.100
 # With parameters
 ."Windows Update Script 12112025.ps1" -ReportPath "D:\Reports" -MaxWaitMinutes 240 -CheckIntervalSeconds 60
 
+# Save credentials to Windows Credential Manager (first time)
+."Windows Update Script 12112025.ps1" -SaveCredential
+
+# Subsequent runs auto-load saved credentials (no prompt)
+."Windows Update Script 12112025.ps1"
+
+# Remove saved credentials
+."Windows Update Script 12112025.ps1" -ClearCredential
+
 # Regenerate report from existing session data (no deployment)
 ."Windows Update Script 12112025.ps1" -ReportOnly -SessionPath "C:\WindowsUpdateReports\Session_20250315_143022"
 ```
@@ -69,13 +80,20 @@ Site-PC-03,10.0.2.100
 | `-ThrottleLimit` | `50` | Maximum concurrent Phase 1 job-start operations |
 | `-ReportOnly` | switch | Regenerate HTML report from existing session CSVs (skips Phases 1-3) |
 | `-SessionPath` | — | Path to existing session folder (required with `-ReportOnly`) |
+| `-SaveCredential` | switch | Save prompted credentials to Windows Credential Manager |
+| `-ClearCredential` | switch | Remove saved credentials from Credential Manager and exit |
 
 ## How It Works
 
 ```mermaid
 flowchart TD
-    Start([Start]) --> Creds[Prompt for Admin Credentials]
-    Creds --> CredVal{Validate credentials\nagainst first reachable machine}
+    Start([Start]) --> CredCM{Saved credentials\nin Credential Manager?}
+    CredCM -->|Yes| CredLoaded[Load saved credentials]
+    CredCM -->|No| Creds[Prompt for credentials]
+    Creds -->|SaveCredential| CredSave[Save to Credential Manager]
+    CredSave --> CredVal
+    Creds --> CredVal
+    CredLoaded --> CredVal{Validate credentials\nagainst first reachable machine}
     CredVal -->|Invalid| Exit([Exit])
     CredVal -->|Valid| CSV[Select CSV File]
     CSV --> Validate{Validate CSV\nName + IP columns}
