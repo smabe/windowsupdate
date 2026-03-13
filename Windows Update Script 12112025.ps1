@@ -29,10 +29,6 @@ param(
     [Parameter(Mandatory=$false)]
     [int]$MaxRetries = 2,
 
-    # Seconds to wait for WSMan TCP reachability before marking a host unreachable
-    [Parameter(Mandatory=$false)]
-    [int]$WSManTimeoutSeconds = 10,
-
     # Maximum number of concurrent Phase 1 job-start operations
     [Parameter(Mandatory=$false)]
     [int]$ThrottleLimit = 50,
@@ -42,9 +38,121 @@ param(
 
     # Path to an existing session folder containing CSVs (required with -ReportOnly)
     [Parameter(Mandatory=$false)]
-    [string]$SessionPath
+    [string]$SessionPath,
+
+    # Save credentials to Windows Credential Manager after successful validation
+    [switch]$SaveCredential,
+
+    # Remove saved credentials from Windows Credential Manager and exit
+    [switch]$ClearCredential
 )
  
+# ── Windows Credential Manager (native P/Invoke) ──────────────────────────────
+$script:WUCredentialTarget = "WindowsUpdateScript"
+
+if (-not ([System.Management.Automation.PSTypeName]'WU.CredentialManager').Type) {
+    Add-Type -Namespace 'WU' -Name 'CredentialManager' -MemberDefinition @'
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool CredWrite(ref CREDENTIAL credential, uint flags);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool CredRead(string targetName, uint type, uint flags, out IntPtr credential);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool CredDelete(string targetName, uint type, uint flags);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern void CredFree(IntPtr credential);
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct CREDENTIAL {
+            public uint Flags;
+            public uint Type;
+            public string TargetName;
+            public string Comment;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+            public uint CredentialBlobSize;
+            public IntPtr CredentialBlob;
+            public uint Persist;
+            public uint AttributeCount;
+            public IntPtr Attributes;
+            public string TargetAlias;
+            public string UserName;
+        }
+
+        public const uint CRED_TYPE_GENERIC = 1;
+        public const uint CRED_PERSIST_LOCAL_MACHINE = 2;
+'@
+}
+
+function Save-WUCredential {
+    param([PSCredential]$Credential)
+    $passwordBytes = [System.Text.Encoding]::Unicode.GetBytes($Credential.GetNetworkCredential().Password)
+    $passwordPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($passwordBytes.Length)
+    try {
+        [System.Runtime.InteropServices.Marshal]::Copy($passwordBytes, 0, $passwordPtr, $passwordBytes.Length)
+        $cred = New-Object WU.CredentialManager+CREDENTIAL
+        $cred.Type = [WU.CredentialManager]::CRED_TYPE_GENERIC
+        $cred.TargetName = $script:WUCredentialTarget
+        $cred.UserName = $Credential.UserName
+        $cred.CredentialBlobSize = [uint32]$passwordBytes.Length
+        $cred.CredentialBlob = $passwordPtr
+        $cred.Persist = [WU.CredentialManager]::CRED_PERSIST_LOCAL_MACHINE
+        $cred.Comment = "Windows Update Deployment Script"
+        $result = [WU.CredentialManager]::CredWrite([ref]$cred, 0)
+        if (-not $result) { throw "CredWrite failed: error $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
+        return $true
+    } finally {
+        [System.Runtime.InteropServices.Marshal]::FreeHGlobal($passwordPtr)
+    }
+}
+
+function Get-WUSavedCredential {
+    $credPtr = [IntPtr]::Zero
+    try {
+        $result = [WU.CredentialManager]::CredRead($script:WUCredentialTarget, [WU.CredentialManager]::CRED_TYPE_GENERIC, 0, [ref]$credPtr)
+        if (-not $result) { return $null }
+        $credStruct = [System.Runtime.InteropServices.Marshal]::PtrToStructure($credPtr, [Type][WU.CredentialManager+CREDENTIAL])
+        $password = ""
+        if ($credStruct.CredentialBlobSize -gt 0 -and $credStruct.CredentialBlob -ne [IntPtr]::Zero) {
+            $passwordBytes = New-Object byte[] $credStruct.CredentialBlobSize
+            [System.Runtime.InteropServices.Marshal]::Copy($credStruct.CredentialBlob, $passwordBytes, 0, $credStruct.CredentialBlobSize)
+            $password = [System.Text.Encoding]::Unicode.GetString($passwordBytes)
+        }
+        $secPass = ConvertTo-SecureString $password -AsPlainText -Force
+        return New-Object PSCredential($credStruct.UserName, $secPass)
+    } finally {
+        if ($credPtr -ne [IntPtr]::Zero) { [WU.CredentialManager]::CredFree($credPtr) }
+    }
+}
+
+function Remove-WUSavedCredential {
+    [WU.CredentialManager]::CredDelete($script:WUCredentialTarget, [WU.CredentialManager]::CRED_TYPE_GENERIC, 0) | Out-Null
+}
+
+# ── Handle -ClearCredential ──
+if ($ClearCredential) {
+    $existing = Get-WUSavedCredential
+    if ($existing) {
+        Remove-WUSavedCredential
+        Write-Host "Saved credentials removed from Windows Credential Manager." -ForegroundColor Green
+    } else {
+        Write-Host "No saved credentials found." -ForegroundColor Yellow
+    }
+    exit
+}
+
+# ── Helper: Test WinRM reachability using Test-WSMan (more reliable than raw TCP) ──
+function Test-S2WinRM {
+    param([string]$ComputerName)
+    try {
+        $null = Test-WSMan -ComputerName $ComputerName -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 if ($ReportOnly) {
     # ============================================
     # REPORT-ONLY MODE: Load existing session data
@@ -140,9 +248,25 @@ Register-EngineEvent PowerShell.Exiting -Action {
 # INITIALIZATION
 # ============================================
 
-# Credentials
-
-$cred = Get-Credential -Message "Enter administrator credentials for remote computers"
+# Credentials — try Windows Credential Manager first, fall back to prompt
+$cred = Get-WUSavedCredential
+if ($cred) {
+    Write-Host "Using saved credentials for '$($cred.UserName)' from Windows Credential Manager" -ForegroundColor Green
+    Write-Host "  (Run with -ClearCredential to remove, or -SaveCredential with new creds to update)" -ForegroundColor DarkGray
+} else {
+    $cred = Get-Credential -Message "Enter administrator credentials for remote computers"
+    if (-not $cred) { Write-Host "No credentials provided. Exiting." -ForegroundColor Red; exit }
+    if ($SaveCredential) {
+        try {
+            Save-WUCredential -Credential $cred
+            Write-Host "Credentials saved to Windows Credential Manager" -ForegroundColor Green
+        } catch {
+            Write-Host "Warning: Could not save credentials — $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "  Tip: Run with -SaveCredential to remember these credentials" -ForegroundColor DarkGray
+    }
+}
 Write-Host "Choose CSV file for computer list..." -ForegroundColor Cyan
 $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
 $openFileDialog.InitialDirectory = [Environment]::GetFolderPath("Desktop")
@@ -204,10 +328,6 @@ function Wait-ForUpdateJobs {
         [Parameter(Mandatory=$false)]
         [int]$MaxRetries = 2,
 
-        # Seconds to wait for TCP WinRM port before marking a host unreachable
-        [Parameter(Mandatory=$false)]
-        [int]$WSManTimeoutSeconds = 10,
-
         # Computers that failed Phase 1 — checked every 3rd iteration for late arrival
         [Parameter(Mandatory=$false)]
         [object[]]$LateArrivals = @(),
@@ -244,18 +364,10 @@ function Wait-ForUpdateJobs {
     }
  
     # ── WSMan pre-check ──────────────────────────────────────────────────────────
-    # Fast TCP connect to port 5985 with configurable timeout avoids long DNS/network
-    # hangs that Test-WSMan alone would cause on truly unreachable hosts.
-    Write-Host "Running WSMan connectivity check against $($Computers.Count) computers (timeout: ${WSManTimeoutSeconds}s)..." -ForegroundColor Cyan
+    Write-Host "Running WSMan connectivity check against $($Computers.Count) computers..." -ForegroundColor Cyan
     foreach ($computer in $Computers) {
         $target = if ($computer.IP) { $computer.IP } else { $computer.Name }
-        $reachable = $false
-        try {
-            $tcp = New-Object System.Net.Sockets.TcpClient
-            $asyncResult = $tcp.BeginConnect($target, 5985, $null, $null)
-            $reachable = $asyncResult.AsyncWaitHandle.WaitOne($WSManTimeoutSeconds * 1000, $false) -and $tcp.Connected
-            $tcp.Close()
-        } catch { $reachable = $false }
+        $reachable = Test-S2WinRM -ComputerName $target
 
         if (-not $reachable) {
             Write-Host "  ⚠️  $($computer.Name): Not reachable on WinRM port — will be skipped" -ForegroundColor Yellow
@@ -320,14 +432,8 @@ function Wait-ForUpdateJobs {
                     $toRemove.Add($la) | Out-Null  # give up — will stay as JobStartFailed
                     continue
                 }
-                # Quick TCP check
-                $laReachable = $false
-                try {
-                    $tcp = New-Object System.Net.Sockets.TcpClient
-                    $ar = $tcp.BeginConnect($la.IP, 5985, $null, $null)
-                    $laReachable = $ar.AsyncWaitHandle.WaitOne($WSManTimeoutSeconds * 1000, $false) -and $tcp.Connected
-                    $tcp.Close()
-                } catch {}
+                # Quick WinRM check
+                $laReachable = Test-S2WinRM -ComputerName $la.IP
 
                 if ($laReachable) {
                     Write-Host "  🔁 $($la.Name): Now reachable — starting job (late arrival)" -ForegroundColor Magenta
@@ -359,16 +465,9 @@ function Wait-ForUpdateJobs {
                 continue
             }
             
-            # ── Quick TCP pre-check to avoid expensive Invoke-Command on offline machines ──
+            # ── Quick WinRM pre-check to avoid expensive Invoke-Command on offline machines ──
             $target = if ($computer.IP) { $computer.IP } else { $computer.Name }
-            $tcpReachable = $false
-            try {
-                $tcp = New-Object System.Net.Sockets.TcpClient
-                $ar = $tcp.BeginConnect($target, 5985, $null, $null)
-                $tcpReachable = $ar.AsyncWaitHandle.WaitOne($WSManTimeoutSeconds * 1000, $false) -and $tcp.Connected
-                $tcp.Close()
-            } catch {}
-            if (-not $tcpReachable) {
+            if (-not (Test-S2WinRM -ComputerName $target)) {
                 $computerStatus[$computer.Name] = "Unreachable"
                 $stillRunning++
                 continue
@@ -640,12 +739,8 @@ foreach ($testTarget in $computers) {
     $credTestCount++
     $target = if ($testTarget.IP) { $testTarget.IP } else { $testTarget.Name }
     try {
-        # Quick TCP check first
-        $tcp = New-Object System.Net.Sockets.TcpClient
-        $ar = $tcp.BeginConnect($target, 5985, $null, $null)
-        $tcpOk = $ar.AsyncWaitHandle.WaitOne($WSManTimeoutSeconds * 1000, $false) -and $tcp.Connected
-        $tcp.Close()
-        if (-not $tcpOk) { continue }
+        # Quick WinRM check first
+        if (-not (Test-S2WinRM -ComputerName $target)) { continue }
 
         Invoke-Command -ComputerName $target -Credential $cred -ScriptBlock { $env:COMPUTERNAME } -ErrorAction Stop | Out-Null
         Write-Host "  Credentials validated against $($testTarget.Name)" -ForegroundColor Green
@@ -744,20 +839,17 @@ $jobResults = $computers | ForEach-Object -Parallel {
     $rtPath        = $using:RemoteTempPath   # capture for use inside Invoke-Command
     $jobBlock      = [scriptblock]::Create($using:jobStartBlockStr)
 
-    # Pre-flight: quick TCP check on WinRM port before attempting full Invoke-Command.
-    # Saves ~20s per offline machine (avoids the full WinRM connection timeout).
+    # Pre-flight: WinRM check before attempting full Invoke-Command.
     $target = if ($IP) { $IP } else { $site }
     $preFlightOk = $false
     try {
-        $tcp = New-Object System.Net.Sockets.TcpClient
-        $ar  = $tcp.BeginConnect($target, 5985, $null, $null)
-        $preFlightOk = $ar.AsyncWaitHandle.WaitOne(($using:WSManTimeoutSeconds) * 1000, $false) -and $tcp.Connected
-        $tcp.Close()
+        $null = Test-WSMan -ComputerName $target -ErrorAction Stop
+        $preFlightOk = $true
     } catch {}
 
     if (-not $preFlightOk) {
-        Write-Host "  [$site] Not reachable on port 5985 — skipping" -ForegroundColor DarkYellow
-        return [PSCustomObject]@{ Site = $site; IP = $IP; Status = "Unreachable-PreFlight"; Error = "TCP 5985 not reachable" }
+        Write-Host "  [$site] WinRM not reachable — skipping" -ForegroundColor DarkYellow
+        return [PSCustomObject]@{ Site = $site; IP = $IP; Status = "Unreachable-PreFlight"; Error = "WinRM not reachable" }
     }
 
     try {
@@ -810,7 +902,6 @@ $monitoringResults = Wait-ForUpdateJobs -Computers $computersToMonitor -Credenti
                                         -RemoteTempPath $RemoteTempPath `
                                         -LogStabilitySeconds $LogStabilitySeconds `
                                         -MaxRetries $MaxRetries `
-                                        -WSManTimeoutSeconds $WSManTimeoutSeconds `
                                         -LateArrivals $lateArrivalComputers `
                                         -JobStartScript $jobStartBlock
 
