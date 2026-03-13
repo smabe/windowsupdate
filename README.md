@@ -171,8 +171,9 @@ Each run creates a timestamped session folder under `C:\WindowsUpdateReports\`:
 ```
 Session_20250315_143022/
   job_start_status.csv        # Phase 1 results per computer
-  computer_summary.csv         # Per-computer update counts and status
-  all_updates.csv              # Every update across all machines (with Verified column)
+  computer_summary.csv         # Per-computer summary (includes MachineHostname, AllIPAddresses)
+  all_updates.csv              # Every update across all machines (with Verified + MachineHostname)
+  installed_hotfixes.csv       # Full Get-HotFix history per host (for correlation matching)
   rerun_computers.csv          # Machines that need another pass (if any)
   WindowsUpdateReport.html     # Interactive report (open in browser)
 ```
@@ -244,13 +245,16 @@ Phase 3 uses batched operations for fast collection across large fleets:
 ### How It Works
 
 1. **Reads all_updates.csv** — builds an IP+KB lookup table and tracks installed cumulative updates (parsed from the Title column, e.g., `"2026-03 Security Update (KB5079473)"`)
-2. **Incorporates previous logs** (with `-IncludePreviousLogs`) — reads `previous_updatelog_*.csv` files from the session directory and uses `computer_summary.csv` for Name→IP mapping
-3. **Reads Qualys XLSX** (via Excel COM, two-pass):
+2. **Reads installed_hotfixes.csv** (if present) — adds full Get-HotFix history as "Installed" entries, covering KBs installed outside this deployment run
+3. **Builds IP alias map** — reads `AllIPAddresses` from `computer_summary.csv` so machines with multiple NICs can match regardless of which IP Qualys scanned
+4. **Incorporates previous logs** (with `-IncludePreviousLogs`) — reads `previous_updatelog_*.csv` files from the session directory and uses `computer_summary.csv` for Name→IP mapping
+5. **Reads Qualys XLSX** (via Excel COM, two-pass):
+   - **Header auto-detection**: Reads row 1 to find column positions (IP, DNS, Title, Results, etc.); falls back to hardcoded positions if headers not found
    - **Pass 1**: Reads all rows and builds a global KB→date map — if KB5077212 has "February 2026" context in any row, that date applies to all rows referencing KB5077212
    - **Pass 2**: Correlates each vulnerability against installed updates
-4. **Matches per host** — for each vulnerability, checks if required KBs were installed:
-   - **Exact match**: KB found in lookup with Status = "Installed" → `Remediated`
-   - **Cumulative supersession**: KB not found, but host has a newer cumulative update (by YYYY-MM date) → `Remediated (Cumulative)`
+6. **Matches per host** — for each vulnerability, checks if required KBs were installed:
+   - **Exact match**: KB found in lookup with Status = "Installed" or "Pending" → `Remediated`
+   - **Cumulative supersession**: KB not found, but host has a newer cumulative update from the **same product family** (Windows, .NET) with a month >= the missing KB's month → `Remediated (Cumulative)`
    - **Not found**: KB missing and no covering cumulative → `Not Remediated`
    - **No KB info**: Vulnerability has no KB reference (EOL OS, app-level) → `Manual Review`
 
@@ -267,14 +271,16 @@ Windows cumulative updates supersede all prior monthly patches. The script uses 
 4-sheet XLSX report:
 | Sheet | Contents |
 |---|---|
-| **Host Summary** | Per-host totals, % remediated (color-coded), latest cumulative installed |
+| **Host Summary** | Per-host totals, % remediated (color-coded), latest cumulative, outstanding items (missing KBs + manual review vulns) |
 | **Vulnerability Detail** | Every vulnerability with remediation status, required KBs, and match details |
 | **Unmatched Hosts** | Hosts in one dataset but not the other (data quality check) |
 | **Cumulative Coverage** | All cumulative updates detected per host with product family and date |
 
 ### Expected Qualys XLSX Columns
 
-| Column Index | Field | Usage |
+Column positions are **auto-detected from the header row**. If headers aren't found, the script falls back to these default positions:
+
+| Default Index | Field | Usage |
 |---|---|---|
 | 1 | IP | Primary match key |
 | 3 | DNS | Hostname display (default) |
@@ -291,7 +297,7 @@ The Qualys XLSX often includes summary rows at the bottom listing hosts that ret
 
 ### Known Limitations
 
-- **IP address space mismatch**: Qualys external scans use public IPs while the deployment script uses internal IPs — hosts scanned externally won't match. The Unmatched Hosts sheet reports these.
-- Cumulative supersession relies on date heuristics — if no date context is available for a missing KB (even across all Qualys entries), exact matching is used
+- **IP address space mismatch**: If `AllIPAddresses` data is available in `computer_summary.csv` (requires latest update script), the correlation script maps all IPs on each machine back to the deployment IP. Without this data, hosts scanned on a different interface won't match. The Unmatched Hosts sheet reports these.
+- Cumulative supersession checks **product family** (Windows vs .NET vs Other) — a Windows cumulative won't cover a .NET KB. If no date context is available for a missing KB (even across all Qualys entries), exact matching is used.
 - Requires Excel COM (Excel must be installed on the machine running the script)
 - Requires PowerShell 7+ (uses `if` as expression syntax)

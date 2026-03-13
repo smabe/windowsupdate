@@ -935,6 +935,7 @@ Write-Host ""
 
 $allUpdateData = @()
 $computerSummary = @()
+$installedHotfixData = @()
 
 # ── Separate computers into collectable vs skip-early groups ──
 $skipComputers = @()
@@ -1043,7 +1044,16 @@ if ($collectableComputers.Count -gt 0) {
                 PendingKBs       = @()
                 RebootRequired   = $false
                 VerifyError      = $null
+                MachineName      = $env:COMPUTERNAME
+                AllIPs           = ""
             }
+
+            # Collect all IPv4 addresses on this machine (for multi-NIC correlation)
+            try {
+                $data.AllIPs = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                    Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.PrefixOrigin -ne 'WellKnown' } |
+                    ForEach-Object { $_.IPAddress }) -join ','
+            } catch { }
 
             # Read CSV content directly (eliminates file copy overhead)
             $logPath = "$rtPath\updatelog.csv"
@@ -1120,6 +1130,7 @@ if ($collectableComputers.Count -gt 0) {
         # Initialize summary
         $summary = [PSCustomObject]@{
             ComputerName = $computerName; IP = $computerIP
+            MachineHostname = ""; AllIPAddresses = ""
             Status = $monitoringResults.Status[$computerName]
             TotalUpdates = 0; Installed = 0; Failed = 0; Skipped = 0; InstalledWithErrors = 0
             RebootRequired = $false; CollectionError = ""; PreviousRunArchive = ""
@@ -1135,6 +1146,10 @@ if ($collectableComputers.Count -gt 0) {
             $computerSummary += $summary
             continue
         }
+
+        # Populate machine identity from remote data
+        if ($result.MachineName) { $summary.MachineHostname = $result.MachineName }
+        if ($result.AllIPs) { $summary.AllIPAddresses = $result.AllIPs }
 
         Write-Host "  [$computerName] " -NoNewline
 
@@ -1172,6 +1187,20 @@ if ($collectableComputers.Count -gt 0) {
                     }
                     foreach ($kb in $result.PendingKBs) {
                         $pendingKBs[$kb] = $true
+                    }
+                }
+
+                # Collect full hotfix list for installed_hotfixes.csv export
+                if ($result.Hotfixes) {
+                    foreach ($hf in $result.Hotfixes) {
+                        if ($hf) {
+                            $installedHotfixData += [PSCustomObject]@{
+                                ComputerName    = $computerName
+                                ComputerIP      = $computerIP
+                                MachineHostname = $summary.MachineHostname
+                                KB              = $hf
+                            }
+                        }
                     }
                 }
 
@@ -1262,6 +1291,7 @@ if ($collectableComputers.Count -gt 0) {
                         $allUpdateData += [PSCustomObject]@{
                             ComputerName = $computerName
                             ComputerIP = $computerIP
+                            MachineHostname = $summary.MachineHostname
                             KB = $update.KB
                             Title = $update.Title
                             Size = $update.Size
@@ -1328,6 +1358,9 @@ if ($collectableComputers.Count -gt 0) {
 $computerSummary | Export-Csv "$sessionReportPath\computer_summary.csv" -NoTypeInformation
 if ($allUpdateData.Count -gt 0) {
     $allUpdateData | Export-Csv "$sessionReportPath\all_updates.csv" -NoTypeInformation
+}
+if ($installedHotfixData.Count -gt 0) {
+    $installedHotfixData | Export-Csv "$sessionReportPath\installed_hotfixes.csv" -NoTypeInformation
 }
 
 # Re-run CSV: computers that need another pass (real failures or did not complete)
