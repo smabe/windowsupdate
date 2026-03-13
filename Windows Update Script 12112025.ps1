@@ -38,9 +38,110 @@ param(
 
     # Path to an existing session folder containing CSVs (required with -ReportOnly)
     [Parameter(Mandatory=$false)]
-    [string]$SessionPath
+    [string]$SessionPath,
+
+    # Save credentials to Windows Credential Manager after successful validation
+    [switch]$SaveCredential,
+
+    # Remove saved credentials from Windows Credential Manager and exit
+    [switch]$ClearCredential
 )
  
+# ── Windows Credential Manager (native P/Invoke) ──────────────────────────────
+$script:WUCredentialTarget = "WindowsUpdateScript"
+
+if (-not ([System.Management.Automation.PSTypeName]'WU.CredentialManager').Type) {
+    Add-Type -Namespace 'WU' -Name 'CredentialManager' -MemberDefinition @'
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool CredWrite(ref CREDENTIAL credential, uint flags);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool CredRead(string targetName, uint type, uint flags, out IntPtr credential);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool CredDelete(string targetName, uint type, uint flags);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern void CredFree(IntPtr credential);
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct CREDENTIAL {
+            public uint Flags;
+            public uint Type;
+            public string TargetName;
+            public string Comment;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+            public uint CredentialBlobSize;
+            public IntPtr CredentialBlob;
+            public uint Persist;
+            public uint AttributeCount;
+            public IntPtr Attributes;
+            public string TargetAlias;
+            public string UserName;
+        }
+
+        public const uint CRED_TYPE_GENERIC = 1;
+        public const uint CRED_PERSIST_LOCAL_MACHINE = 2;
+'@
+}
+
+function Save-WUCredential {
+    param([PSCredential]$Credential)
+    $passwordBytes = [System.Text.Encoding]::Unicode.GetBytes($Credential.GetNetworkCredential().Password)
+    $passwordPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($passwordBytes.Length)
+    try {
+        [System.Runtime.InteropServices.Marshal]::Copy($passwordBytes, 0, $passwordPtr, $passwordBytes.Length)
+        $cred = New-Object WU.CredentialManager+CREDENTIAL
+        $cred.Type = [WU.CredentialManager]::CRED_TYPE_GENERIC
+        $cred.TargetName = $script:WUCredentialTarget
+        $cred.UserName = $Credential.UserName
+        $cred.CredentialBlobSize = [uint32]$passwordBytes.Length
+        $cred.CredentialBlob = $passwordPtr
+        $cred.Persist = [WU.CredentialManager]::CRED_PERSIST_LOCAL_MACHINE
+        $cred.Comment = "Windows Update Deployment Script"
+        $result = [WU.CredentialManager]::CredWrite([ref]$cred, 0)
+        if (-not $result) { throw "CredWrite failed: error $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
+        return $true
+    } finally {
+        [System.Runtime.InteropServices.Marshal]::FreeHGlobal($passwordPtr)
+    }
+}
+
+function Get-WUSavedCredential {
+    $credPtr = [IntPtr]::Zero
+    try {
+        $result = [WU.CredentialManager]::CredRead($script:WUCredentialTarget, [WU.CredentialManager]::CRED_TYPE_GENERIC, 0, [ref]$credPtr)
+        if (-not $result) { return $null }
+        $credStruct = [System.Runtime.InteropServices.Marshal]::PtrToStructure($credPtr, [Type][WU.CredentialManager+CREDENTIAL])
+        $password = ""
+        if ($credStruct.CredentialBlobSize -gt 0 -and $credStruct.CredentialBlob -ne [IntPtr]::Zero) {
+            $passwordBytes = New-Object byte[] $credStruct.CredentialBlobSize
+            [System.Runtime.InteropServices.Marshal]::Copy($credStruct.CredentialBlob, $passwordBytes, 0, $credStruct.CredentialBlobSize)
+            $password = [System.Text.Encoding]::Unicode.GetString($passwordBytes)
+        }
+        $secPass = ConvertTo-SecureString $password -AsPlainText -Force
+        return New-Object PSCredential($credStruct.UserName, $secPass)
+    } finally {
+        if ($credPtr -ne [IntPtr]::Zero) { [WU.CredentialManager]::CredFree($credPtr) }
+    }
+}
+
+function Remove-WUSavedCredential {
+    [WU.CredentialManager]::CredDelete($script:WUCredentialTarget, [WU.CredentialManager]::CRED_TYPE_GENERIC, 0) | Out-Null
+}
+
+# ── Handle -ClearCredential ──
+if ($ClearCredential) {
+    $existing = Get-WUSavedCredential
+    if ($existing) {
+        Remove-WUSavedCredential
+        Write-Host "Saved credentials removed from Windows Credential Manager." -ForegroundColor Green
+    } else {
+        Write-Host "No saved credentials found." -ForegroundColor Yellow
+    }
+    exit
+}
+
 # ── Helper: Test WinRM reachability using Test-WSMan (more reliable than raw TCP) ──
 function Test-S2WinRM {
     param([string]$ComputerName)
@@ -147,9 +248,25 @@ Register-EngineEvent PowerShell.Exiting -Action {
 # INITIALIZATION
 # ============================================
 
-# Credentials
-
-$cred = Get-Credential -Message "Enter administrator credentials for remote computers"
+# Credentials — try Windows Credential Manager first, fall back to prompt
+$cred = Get-WUSavedCredential
+if ($cred) {
+    Write-Host "Using saved credentials for '$($cred.UserName)' from Windows Credential Manager" -ForegroundColor Green
+    Write-Host "  (Run with -ClearCredential to remove, or -SaveCredential with new creds to update)" -ForegroundColor DarkGray
+} else {
+    $cred = Get-Credential -Message "Enter administrator credentials for remote computers"
+    if (-not $cred) { Write-Host "No credentials provided. Exiting." -ForegroundColor Red; exit }
+    if ($SaveCredential) {
+        try {
+            Save-WUCredential -Credential $cred
+            Write-Host "Credentials saved to Windows Credential Manager" -ForegroundColor Green
+        } catch {
+            Write-Host "Warning: Could not save credentials — $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "  Tip: Run with -SaveCredential to remember these credentials" -ForegroundColor DarkGray
+    }
+}
 Write-Host "Choose CSV file for computer list..." -ForegroundColor Cyan
 $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
 $openFileDialog.InitialDirectory = [Environment]::GetFolderPath("Desktop")
