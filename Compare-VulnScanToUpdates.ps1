@@ -1034,6 +1034,7 @@ try {
         }
         $row++
     }
+    $ws1.Cells.WrapText = $false
     $ws1.Columns.Item("A:L").AutoFit() | Out-Null
     # Cap Outstanding Items and Resolution column widths so they don't get absurdly wide
     if ($ws1.Columns.Item("K").ColumnWidth -gt 80) { $ws1.Columns.Item("K").ColumnWidth = 80 }
@@ -1062,6 +1063,7 @@ try {
         $ws2.Cells.Item(2, 1) = "All hosts matched successfully"
         $ws2.Cells.Item(2, 1).Font.Color = 0x008000
     }
+    $ws2.Cells.WrapText = $false
     $ws2.Columns.Item("A:D").AutoFit() | Out-Null
 
     # Remove any extra default sheets
