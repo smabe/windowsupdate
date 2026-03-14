@@ -232,18 +232,20 @@ Phase 3 uses batched operations for fast collection across large fleets:
 ### Usage
 
 ```powershell
-# Basic usage — match by IP address
-.\Compare-VulnScanToUpdates.ps1 -VulnReportPath ".\scan_report.xlsx" -UpdatesCsvPath ".\Session_20260312\all_updates.csv"
+# Point at a session folder (place the Qualys XLSX inside it)
+.\Compare-VulnScanToUpdates.ps1 -Path "C:\temp\Session_20260313_221433"
 
-# Include data from previous deployment runs (previous_updatelog_*.csv files)
-.\Compare-VulnScanToUpdates.ps1 -VulnReportPath ".\scan_report.xlsx" -UpdatesCsvPath ".\Session_20260312\all_updates.csv" -IncludePreviousLogs
+# Include data from previous deployment runs
+.\Compare-VulnScanToUpdates.ps1 -Path "C:\temp\Session_20260313_221433" -IncludePreviousLogs
 
 # Also export a CSV alongside the XLSX report
-.\Compare-VulnScanToUpdates.ps1 -VulnReportPath ".\scan_report.xlsx" -UpdatesCsvPath ".\all_updates.csv" -ExportCsv
+.\Compare-VulnScanToUpdates.ps1 -Path "C:\temp\Session_20260313_221433" -ExportCsv
 
 # Use NetBIOS instead of DNS for hostname display
-.\Compare-VulnScanToUpdates.ps1 -VulnReportPath ".\scan_report.xlsx" -UpdatesCsvPath ".\all_updates.csv" -HostnameColumn NetBIOS
+.\Compare-VulnScanToUpdates.ps1 -Path "C:\temp\Session_20260313_221433" -HostnameColumn NetBIOS
 ```
+
+Place the Qualys scan report (`Scan_Report_NVR__*.xlsx`) in the session folder alongside `all_updates.csv`. The script auto-discovers it.
 
 ### How It Works
 
@@ -276,13 +278,11 @@ Windows cumulative updates supersede all prior monthly patches. The script uses 
 
 ### Output
 
-4-sheet XLSX report:
+2-sheet XLSX report:
 | Sheet | Contents |
 |---|---|
-| **Host Summary** | Per-host totals, % remediated (color-coded), site name, latest cumulative, outstanding items (missing KBs + manual review vulns) |
-| **Vulnerability Detail** | Every vulnerability with remediation status, required KBs, and match details |
+| **Host Summary** | Per-host totals, % remediated (color-coded), site name, latest cumulative, outstanding items (missing KBs + manual review vulns), and resolution details from Qualys for unresolved vulnerabilities |
 | **Unmatched Hosts** | Hosts in one dataset but not the other (data quality check) |
-| **Cumulative Coverage** | All cumulative updates detected per host with product family and date |
 
 ### Expected Qualys XLSX Columns
 
