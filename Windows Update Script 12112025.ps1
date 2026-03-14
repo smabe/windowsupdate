@@ -401,14 +401,16 @@ function Wait-ForUpdateJobs {
 
     # Job-start retry tracking (for machines that passed Phase 1 but never ran their task)
     $waitingStartTime   = @{}  # first time each machine entered "Waiting to start"
-    $runningStartTime   = @{}  # first time each machine entered "Running" (stall detection)
-    $jobStartRetryCount = @{}  # cumulative retry attempts per machine
+    $runningStartTime     = @{}  # first time each machine entered "Running" (stall detection)
+    $unreachableStartTime = @{}  # first time each machine entered "Unreachable" (offline detection)
+    $jobStartRetryCount   = @{}  # cumulative retry attempts per machine
 
     # Visual separator — everything above this line is preserved across refreshes
     Write-Host "`n═══ Live Monitoring (refreshes every ${CheckIntervalSeconds}s) ═══" -ForegroundColor DarkGray
     $monitorTop = [Console]::CursorTop
 
     # Monitor loop
+    $skipAll = $false
     while ((Get-Date) -lt $endTime) {
         $stillRunning = 0
         $completed = 0
@@ -475,7 +477,20 @@ function Wait-ForUpdateJobs {
             $target = if ($computer.IP) { $computer.IP } else { $computer.Name }
             if (-not (Test-S2WinRM -ComputerName $target)) {
                 $computerStatus[$computer.Name] = "Unreachable"
-                $stillRunning++
+                if (-not $unreachableStartTime.ContainsKey($computer.Name)) {
+                    $unreachableStartTime[$computer.Name] = Get-Date
+                }
+                $unreachableMinutes = [int]((Get-Date) - $unreachableStartTime[$computer.Name]).TotalMinutes
+                if ($unreachableMinutes -ge ($RunningStallMinutes * 2)) {
+                    Write-Host "  ⛔ $($computer.Name): Unreachable for ${unreachableMinutes}m — releasing" -ForegroundColor Red
+                    $completedComputers[$computer.Name] = $true
+                    $completed++
+                } elseif ($unreachableMinutes -ge $RunningStallMinutes) {
+                    Write-Host "  ⚠️  $($computer.Name): Unreachable (${unreachableMinutes}m — may be down)" -ForegroundColor DarkYellow
+                    $stillRunning++
+                } else {
+                    $stillRunning++
+                }
                 continue
             }
 
@@ -571,9 +586,22 @@ function Wait-ForUpdateJobs {
             }
 
             if (-not $jobStatus) {
-                Write-Host "  ⚠️  $($computer.Name): Unreachable after $($MaxRetries + 1) attempt(s) (may be rebooting)" -ForegroundColor DarkYellow
                 $computerStatus[$computer.Name] = "Unreachable"
-                $stillRunning++
+                if (-not $unreachableStartTime.ContainsKey($computer.Name)) {
+                    $unreachableStartTime[$computer.Name] = Get-Date
+                }
+                $unreachableMinutes = [int]((Get-Date) - $unreachableStartTime[$computer.Name]).TotalMinutes
+                if ($unreachableMinutes -ge ($RunningStallMinutes * 2)) {
+                    Write-Host "  ⛔ $($computer.Name): Unreachable for ${unreachableMinutes}m — releasing" -ForegroundColor Red
+                    $completedComputers[$computer.Name] = $true
+                    $completed++
+                } elseif ($unreachableMinutes -ge $RunningStallMinutes) {
+                    Write-Host "  ⚠️  $($computer.Name): Unreachable (${unreachableMinutes}m — may be down)" -ForegroundColor DarkYellow
+                    $stillRunning++
+                } else {
+                    Write-Host "  ⚠️  $($computer.Name): Unreachable after $($MaxRetries + 1) attempt(s) (may be rebooting)" -ForegroundColor DarkYellow
+                    $stillRunning++
+                }
                 continue
             }
 
@@ -610,12 +638,15 @@ function Wait-ForUpdateJobs {
                 # Clear stall timers
                 $runningStartTime.Remove($computer.Name) 2>$null
                 $waitingStartTime.Remove($computer.Name) 2>$null
+                $unreachableStartTime.Remove($computer.Name) 2>$null
             } elseif ($jobStatus.TasksRunning -or $jobStatus.JobsRunning -or $jobStatus.UpdateProcessesRunning) {
                 $runningWhat = @()
                 if ($jobStatus.TasksRunning)           { $runningWhat += "Tasks" }
                 if ($jobStatus.JobsRunning)            { $runningWhat += "Jobs" }
                 if ($jobStatus.UpdateProcessesRunning) { $runningWhat += "Processes" }
 
+                # Machine is responding — clear unreachable timer if it had one
+                $unreachableStartTime.Remove($computer.Name) 2>$null
                 # Track running duration for stall detection
                 if (-not $runningStartTime.ContainsKey($computer.Name)) {
                     $runningStartTime[$computer.Name] = Get-Date
@@ -642,8 +673,11 @@ function Wait-ForUpdateJobs {
             } elseif ($jobStatus.LogExists -and -not $jobStatus.LogComplete) {
                 Write-Host "  📝 $($computer.Name): Writing results (log age < ${LogStabilitySeconds}s)..." -ForegroundColor Cyan
                 $computerStatus[$computer.Name] = "Writing"
+                $unreachableStartTime.Remove($computer.Name) 2>$null
                 $stillRunning++
             } else {
+                # Machine is responding — clear unreachable timer if it had one
+                $unreachableStartTime.Remove($computer.Name) 2>$null
                 # Track elapsed wait time for this machine
                 # If previously "Running", credit that time toward the waiting threshold
                 if (-not $waitingStartTime.ContainsKey($computer.Name)) {
@@ -711,9 +745,51 @@ function Wait-ForUpdateJobs {
             break
         }
         
-        # Wait before next check
-        Write-Host "`nNext check in $CheckIntervalSeconds seconds..." -ForegroundColor DarkGray
-        Start-Sleep -Seconds $CheckIntervalSeconds
+        # Wait before next check — with interactive keypress support
+        Write-Host "`nNext check in $CheckIntervalSeconds seconds... [S] Skip remaining  [L] List remaining" -ForegroundColor DarkGray
+        $waitEnd = (Get-Date).AddSeconds($CheckIntervalSeconds)
+        while ((Get-Date) -lt $waitEnd) {
+            if ([Console]::KeyAvailable) {
+                $key = [Console]::ReadKey($true)
+                switch ($key.Key) {
+                    'S' {
+                        Write-Host "`n⚠️  Skip all remaining machines? They will be added to the rerun list. [Y/N]: " -NoNewline -ForegroundColor Yellow
+                        $confirm = Read-Host
+                        if ($confirm -ieq 'Y') {
+                            foreach ($computer in $allMonitored) {
+                                if (-not $completedComputers[$computer.Name] -and -not $ignoredComputers[$computer.Name]) {
+                                    $computerStatus[$computer.Name] = "Skipped"
+                                    $completedComputers[$computer.Name] = $true
+                                }
+                            }
+                            Write-Host "✓ All remaining machines skipped" -ForegroundColor Yellow
+                            $skipAll = $true
+                        }
+                    }
+                    'L' {
+                        Write-Host "`n── Remaining machines ──" -ForegroundColor Cyan
+                        foreach ($computer in $allMonitored) {
+                            if (-not $completedComputers[$computer.Name] -and -not $ignoredComputers[$computer.Name]) {
+                                $st = $computerStatus[$computer.Name]
+                                $elapsed = ""
+                                if ($runningStartTime.ContainsKey($computer.Name)) {
+                                    $elapsed = " ($([int]((Get-Date) - $runningStartTime[$computer.Name]).TotalMinutes)m)"
+                                } elseif ($unreachableStartTime.ContainsKey($computer.Name)) {
+                                    $elapsed = " ($([int]((Get-Date) - $unreachableStartTime[$computer.Name]).TotalMinutes)m)"
+                                } elseif ($waitingStartTime.ContainsKey($computer.Name)) {
+                                    $elapsed = " ($([int]((Get-Date) - $waitingStartTime[$computer.Name]).TotalMinutes)m)"
+                                }
+                                Write-Host "  - $($computer.Name): $st$elapsed" -ForegroundColor Gray
+                            }
+                        }
+                        Write-Host ""
+                    }
+                }
+                if ($skipAll) { break }
+            }
+            Start-Sleep -Milliseconds 250
+        }
+        if ($skipAll) { break }
     }
     
     # Timeout handling
@@ -981,7 +1057,7 @@ $collectableComputers = @()
 foreach ($computer in $computers) {
     $computerName = $computer.Name
     $status = $monitoringResults.Status[$computerName]
-    if ($status -in @("JobStartFailed", "Stalled")) {
+    if ($status -in @("JobStartFailed", "Stalled", "Skipped")) {
         $skipComputers += $computer
     } elseif (-not $monitoringResults.Completed[$computerName]) {
         $incompleteComputers += $computer
@@ -990,13 +1066,17 @@ foreach ($computer in $computers) {
     }
 }
 
-# Handle JobStartFailed / Stalled computers immediately (no remote work needed)
+# Handle JobStartFailed / Stalled / Skipped computers immediately (no remote work needed)
 foreach ($computer in $skipComputers) {
     $skipStatus = $monitoringResults.Status[$computer.Name]
     if ($skipStatus -eq "Stalled") {
         $errMsg = "Update processes ran but never completed (stalled)"
         Write-Host "[$($computer.Name)] " -NoNewline
         Write-Host "Stalled — $errMsg" -ForegroundColor DarkYellow
+    } elseif ($skipStatus -eq "Skipped") {
+        $errMsg = "Skipped by operator during monitoring"
+        Write-Host "[$($computer.Name)] " -NoNewline
+        Write-Host "Skipped — $errMsg" -ForegroundColor DarkYellow
     } else {
         $phase1Error = ($jobResults | Where-Object { $_.Site -eq $computer.Name } | Select-Object -First 1).Error
         $errMsg = if ($phase1Error) { "Job did not start: $phase1Error" } else { "Job did not start" }
@@ -1124,7 +1204,9 @@ if ($collectableComputers.Count -gt 0) {
 
             # Verification: Get-HotFix (installed patches)
             try {
-                $data.Hotfixes = @(Get-HotFix -ErrorAction Stop | ForEach-Object { $_.HotFixID })
+                $data.Hotfixes = @(Get-HotFix -ErrorAction Stop | ForEach-Object {
+                    @{ ID = $_.HotFixID; Description = $_.Description; InstalledOn = if ($_.InstalledOn) { $_.InstalledOn.ToString('yyyy-MM-dd') } else { '' } }
+                })
             } catch {
                 $data.VerifyError = "Get-HotFix: $($_.Exception.Message)"
             }
@@ -1229,24 +1311,10 @@ if ($collectableComputers.Count -gt 0) {
                 if ($result.Hotfixes -or $result.PendingKBs) {
                     $hasVerification = $true
                     foreach ($hf in $result.Hotfixes) {
-                        if ($hf) { $installedKBs[$hf] = $true }
+                        if ($hf.ID) { $installedKBs[$hf.ID] = $true }
                     }
                     foreach ($kb in $result.PendingKBs) {
                         $pendingKBs[$kb] = $true
-                    }
-                }
-
-                # Collect full hotfix list for installed_hotfixes.csv export
-                if ($result.Hotfixes) {
-                    foreach ($hf in $result.Hotfixes) {
-                        if ($hf) {
-                            $installedHotfixData += [PSCustomObject]@{
-                                ComputerName    = $computerName
-                                ComputerIP      = $computerIP
-                                MachineHostname = $summary.MachineHostname
-                                KB              = $hf
-                            }
-                        }
                     }
                 }
 
@@ -1396,10 +1464,26 @@ if ($collectableComputers.Count -gt 0) {
             $summary.Status = "Completed"
         }
 
+        # Collect full hotfix list for installed_hotfixes.csv export (all machines, not just those with updates)
+        if ($result -and $result.Hotfixes) {
+            foreach ($hf in $result.Hotfixes) {
+                if ($hf.ID) {
+                    $installedHotfixData += [PSCustomObject]@{
+                        ComputerName    = $computerName
+                        ComputerIP      = $computerIP
+                        MachineHostname = $summary.MachineHostname
+                        KB              = $hf.ID
+                        Description     = $hf.Description
+                        InstalledOn     = $hf.InstalledOn
+                    }
+                }
+            }
+        }
+
         $computerSummary += $summary
     }
 }
- 
+
 # Save collected data
 $computerSummary | Export-Csv "$sessionReportPath\computer_summary.csv" -NoTypeInformation
 if ($allUpdateData.Count -gt 0) {
@@ -1412,7 +1496,7 @@ if ($installedHotfixData.Count -gt 0) {
 # Re-run CSV: computers that need another pass (real failures or did not complete)
 $rerunList = $computerSummary | Where-Object {
     $_.Failed -gt 0 -or
-    $_.Status -in @('Incomplete', 'CollectionFailed', 'Unreachable', 'Ignored-WSMAN', 'JobStartFailed', 'Stalled', 'Inconclusive')
+    $_.Status -in @('Incomplete', 'CollectionFailed', 'Unreachable', 'Ignored-WSMAN', 'JobStartFailed', 'Stalled', 'Skipped', 'Inconclusive')
 }
 if ($rerunList) {
     $rerunCsvPath = Join-Path $sessionReportPath "rerun_computers.csv"
@@ -1746,7 +1830,7 @@ if ($computersWithFailures.Count -gt 0) {
 "@
 }
 
-$computersWithConnectionFailures = $computerSummary | Where-Object { $_.Status -eq "Ignored-WSMAN" -or $_.Status -eq "Incomplete" -or $_.Status -eq "CollectionFailed" -or $_.Status -eq "JobStartFailed" -or $_.Status -eq "Stalled" } | Sort-Object ComputerName
+$computersWithConnectionFailures = $computerSummary | Where-Object { $_.Status -eq "Ignored-WSMAN" -or $_.Status -eq "Incomplete" -or $_.Status -eq "CollectionFailed" -or $_.Status -eq "JobStartFailed" -or $_.Status -eq "Stalled" -or $_.Status -eq "Skipped" } | Sort-Object ComputerName
 if ($computersWithConnectionFailures.Count -gt 0) {
     $html += @"
     <div class="alert-banner connection">
@@ -1766,6 +1850,7 @@ if ($computersWithConnectionFailures.Count -gt 0) {
             "CollectionFailed" { "Collection failed" }
             "JobStartFailed"   { "Job start failed" }
             "Stalled"          { "Stalled (processes hung)" }
+            "Skipped"          { "Skipped by operator" }
             default            { $cc.Status }
         }
         $html += "            <span class=`"alert-chip conn`" onclick=`"scrollToComputer('$cn')`">$safeName &mdash; $statusReason</span>`n"
@@ -1884,7 +1969,7 @@ foreach ($summary in $computerSummary | Sort-Object @{Expression={if([int]$_.Fai
     $cleanName = $computerName -replace '[^a-zA-Z0-9]', '_'
     $safeComputerName = ConvertTo-HtmlEncoded $computerName
     $hasFailures = [int]$summary.Failed -gt 0
-    $isUnreachable = $summary.Status -in @("Ignored-WSMAN", "Incomplete", "CollectionFailed", "JobStartFailed", "Stalled", "Inconclusive")
+    $isUnreachable = $summary.Status -in @("Ignored-WSMAN", "Incomplete", "CollectionFailed", "JobStartFailed", "Stalled", "Skipped", "Inconclusive")
 
     $statusBadge = switch ($summary.Status) {
         "Completed"        { '<span class="badge-sm status-ok">Completed</span>' }
@@ -1895,6 +1980,7 @@ foreach ($summary in $computerSummary | Sort-Object @{Expression={if([int]$_.Fai
         "CollectionFailed" { '<span class="badge-sm status-fail">Collection Failed</span>' }
         "JobStartFailed"   { '<span class="badge-sm status-fail">Job Failed</span>' }
         "Stalled"          { '<span class="badge-sm status-fail">Stalled</span>' }
+        "Skipped"          { '<span class="badge-sm status-warn">Skipped</span>' }
         default            { "<span class=`"badge-sm status-warn`">$($summary.Status)</span>" }
     }
 
@@ -2184,7 +2270,7 @@ $null = $html += @"
             for (let i = 0; i < rows.length; i += 2) {
                 pairs.push({ row: rows[i], detail: rows[i+1] });
             }
-            const priority = { 'Failed':1, 'Stalled':2, 'JobStartFailed':3, 'CollectionFailed':4, 'Incomplete':5, 'Ignored-WSMAN':6, 'Completed':7, 'NoUpdatesNeeded':8 };
+            const priority = { 'Failed':1, 'Stalled':2, 'Skipped':3, 'JobStartFailed':4, 'CollectionFailed':5, 'Incomplete':6, 'Ignored-WSMAN':7, 'Completed':8, 'NoUpdatesNeeded':9 };
             pairs.sort((a, b) => {
                 const as = a.row.getAttribute('data-status') || '';
                 const bs = b.row.getAttribute('data-status') || '';

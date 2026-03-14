@@ -214,6 +214,8 @@ Phase 3 uses batched operations for fast collection across large fleets:
 | Defender updates show as Failed | Expected — Defender self-updates; script marks these as Skipped |
 | Jobs stuck in "Waiting" | Script auto-retries after 30 min; check remote `C:\temp` for artifacts |
 | Machine stuck "Running (Processes)" | Stall detection warns at 15 min, auto-releases at 30 min as "Stalled" — machine goes to rerun list. Time spent in "Running" carries over if it transitions to "Waiting" |
+| Machine stuck "Unreachable" | Unreachable stall detection warns at 15 min, auto-releases at 30 min — machine goes to rerun list. Timer resets if the machine comes back online |
+| Want to skip remaining machines | Press **S** during the 30-second wait between poll cycles, then confirm with **Y**. All remaining machines are marked "Skipped" and added to the rerun list. Press **L** to list remaining machines and their elapsed times |
 | Double-hop auth failures | Script uses `Copy-Item -FromSession` to avoid double-hop issues |
 | Status shows "Inconclusive" | Empty update log without completion marker — job may have crashed; re-run |
 | Verified shows "Pending" | Update installed but not yet in hotfix list — machine needs reboot |
@@ -246,14 +248,15 @@ Phase 3 uses batched operations for fast collection across large fleets:
 ### How It Works
 
 1. **Reads all_updates.csv** — builds an IP+KB lookup table and tracks installed cumulative updates (parsed from the Title column, e.g., `"2026-03 Security Update (KB5079473)"`)
-2. **Reads installed_hotfixes.csv** (if present) — adds full Get-HotFix history as "Installed" entries, covering KBs installed outside this deployment run
+2. **Reads installed_hotfixes.csv** (if present) — adds full Get-HotFix history as "Installed" entries, covering KBs installed outside this deployment run. Uses `Description` ("Security Update") and `InstalledOn` date to detect cumulatives even without title info.
 3. **Builds IP alias map** — reads `AllIPAddresses` from `computer_summary.csv` so machines with multiple NICs can match regardless of which IP Qualys scanned
-4. **Incorporates previous logs** (with `-IncludePreviousLogs`) — reads `previous_updatelog_*.csv` files from the session directory and uses `computer_summary.csv` for Name→IP mapping
-5. **Reads Qualys XLSX** (via Excel COM, two-pass):
+4. **Session-verified coverage** — hosts with `NoUpdatesNeeded` or `Completed` status in `computer_summary.csv` get cumulative coverage for the session month, even if `Get-HotFix` doesn't list the latest cumulative (a known `Win32_QuickFixEngineering` limitation)
+5. **Incorporates previous logs** (with `-IncludePreviousLogs`) — reads `previous_updatelog_*.csv` files from the session directory and uses `computer_summary.csv` for Name→IP mapping
+6. **Reads Qualys XLSX** (via Excel COM, two-pass):
    - **Header auto-detection**: Reads row 1 to find column positions (IP, DNS, Title, Results, etc.); falls back to hardcoded positions if headers not found
-   - **Pass 1**: Reads all rows and builds a global KB→date map — if KB5077212 has "February 2026" context in any row, that date applies to all rows referencing KB5077212
+   - **Pass 1**: Reads all rows and builds a global KB→date map — if KB5077212 has "February 2026" context in any row, that date applies to all rows referencing KB5077212. Date extraction prioritizes Title ("Month YYYY") over Results/Solution (YYYY-MM) for reliability, and validates months 1-12 to prevent CVE number contamination.
    - **Pass 2**: Correlates each vulnerability against installed updates
-6. **Matches per host** — for each vulnerability, checks if required KBs were installed:
+7. **Matches per host** — for each vulnerability, checks if required KBs were installed:
    - **Exact match**: KB found in lookup with Status = "Installed" or "Pending" → `Remediated`
    - **Cumulative supersession**: KB not found, but host has a newer cumulative update from the **same product family** (Windows, .NET) with a month >= the missing KB's month → `Remediated (Cumulative)`
    - **Not found**: KB missing and no covering cumulative → `Not Remediated`
@@ -261,18 +264,22 @@ Phase 3 uses batched operations for fast collection across large fleets:
 
 ### Cumulative Update Logic
 
-Windows cumulative updates supersede all prior monthly patches. The script uses a two-pass approach:
+Windows cumulative updates supersede all prior monthly patches. The script uses multiple detection strategies:
 
-1. **Global KB date map**: All Qualys entries are scanned first to build a KB→date mapping. Date context is extracted from vulnerability titles (e.g., "Security Update for January 2026"), Results column (YYYY-MM patterns), and Solution column. This ensures that even entries without explicit dates benefit from date information found elsewhere for the same KB.
+1. **Global KB date map**: All Qualys entries are scanned first to build a KB→date mapping. Date context is extracted from vulnerability titles (e.g., "Security Update for January 2026"), Results column (YYYY-MM patterns), and Solution column. Title is checked first (most reliable — never contains CVE numbers). All YYYY-MM regex matches validate month 1-12 to prevent CVE identifiers (e.g., `CVE-2026-20805`) from being parsed as invalid dates.
 
-2. **Supersession check**: For each missing KB, if the host has an installed cumulative update from the same product family (Windows, .NET, Other) with a month >= the missing KB's month, the vulnerability is marked `Remediated (Cumulative)`.
+2. **Hotfix metadata detection**: When `installed_hotfixes.csv` includes `Description` and `InstalledOn` columns, KBs with `Description = "Security Update"` are treated as cumulatives. The `InstalledOn` date provides the supersession month, and the product family defaults to "Windows" when no title is available (monthly OS cumulatives are the vast majority of "Security Update" entries from Get-HotFix).
+
+3. **Session-verified coverage**: `Get-HotFix` (`Win32_QuickFixEngineering`) doesn't always list the newest cumulative update. When a host has `NoUpdatesNeeded` or `Completed` status in `computer_summary.csv`, the session date (from the folder name) is used as proof of cumulative coverage — PSWindowsUpdate confirmed the machine was current.
+
+4. **Supersession check**: For each missing KB, if the host has an installed cumulative update from the same product family (Windows, .NET, Other) with a month >= the missing KB's month, the vulnerability is marked `Remediated (Cumulative)`.
 
 ### Output
 
 4-sheet XLSX report:
 | Sheet | Contents |
 |---|---|
-| **Host Summary** | Per-host totals, % remediated (color-coded), latest cumulative, outstanding items (missing KBs + manual review vulns) |
+| **Host Summary** | Per-host totals, % remediated (color-coded), site name, latest cumulative, outstanding items (missing KBs + manual review vulns) |
 | **Vulnerability Detail** | Every vulnerability with remediation status, required KBs, and match details |
 | **Unmatched Hosts** | Hosts in one dataset but not the other (data quality check) |
 | **Cumulative Coverage** | All cumulative updates detected per host with product family and date |
@@ -299,6 +306,8 @@ The Qualys XLSX often includes summary rows at the bottom listing hosts that ret
 ### Known Limitations
 
 - **IP address space mismatch**: If `AllIPAddresses` data is available in `computer_summary.csv` (requires latest update script), the correlation script maps all IPs on each machine back to the deployment IP. Without this data, hosts scanned on a different interface won't match. The Unmatched Hosts sheet reports these.
+- **Cumulative supersession from hotfix history**: KBs known only from `installed_hotfixes.csv` (pre-installed, not deployed this run) inherit cumulative metadata from `all_updates.csv` if the same KB appears there on any machine. KBs with `Description = "Security Update"` and `InstalledOn` date default to "Windows" product family when no title is available.
 - Cumulative supersession checks **product family** (Windows vs .NET vs Other) — a Windows cumulative won't cover a .NET KB. If no date context is available for a missing KB (even across all Qualys entries), exact matching is used.
+- **Session-verified coverage** depends on the session folder timestamp and `computer_summary.csv` being present. It only applies to hosts with `NoUpdatesNeeded` or `Completed` status — failed, stalled, or skipped hosts are excluded.
 - Requires Excel COM (Excel must be installed on the machine running the script)
 - Requires PowerShell 7+ (uses `if` as expression syntax)

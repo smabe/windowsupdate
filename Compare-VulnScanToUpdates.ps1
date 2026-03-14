@@ -85,6 +85,7 @@ function Get-CumulativeProductFamily {
     if ($Title -match 'Cumulative.*Update.*Windows|Security Update.*Windows') { return "Windows" }
     if ($Title -match 'Cumulative Update for') { return "Other" }
     if ($Title -match 'Security Update \(KB') { return "Windows" }  # e.g., "2026-03 Security Update (KB5079473)"
+    if ($Title -match 'Windows\s+(10|11|Server)\b') { return "Windows" }  # e.g., "Windows 11, version 25H2"
     return $null
 }
 
@@ -111,6 +112,14 @@ if (-not $hasTitle) {
 $hasIP = $csvCols -contains "ComputerIP"
 if (-not $hasIP) {
     Write-Host "  Warning: 'ComputerIP' column not found — falling back to hostname matching" -ForegroundColor Yellow
+}
+
+# Derive session year-month from folder name (e.g. "Session_20260313_221433" → "2026-03")
+# Used as fallback when update Title lacks a date pattern
+$sessionYearMonth = $null
+$sessionDirName = Split-Path (Split-Path $UpdatesCsvPath -Parent) -Leaf
+if ($sessionDirName -match 'Session_(\d{4})(\d{2})\d{2}') {
+    $sessionYearMonth = "{0}-{1}" -f $Matches[1], $Matches[2]
 }
 
 # Trim all string fields
@@ -161,6 +170,20 @@ foreach ($u in $updates) {
                 }
             }
         }
+        # Fallback: Title has product info but no date (e.g. "Windows 11, version 25H2")
+        # Use session date as the cumulative month
+        elseif ($sessionYearMonth) {
+            $productFamily = Get-CumulativeProductFamily $u.Title
+            if ($productFamily) {
+                if (-not $hostCumulatives[$matchKey]) { $hostCumulatives[$matchKey] = @() }
+                $hostCumulatives[$matchKey] += @{
+                    Product   = $productFamily
+                    YearMonth = $sessionYearMonth
+                    KB        = $kb
+                    Title     = $u.Title
+                }
+            }
+        }
     }
 }
 
@@ -171,6 +194,31 @@ Write-Host "  Unique matchkey+KB combinations: $($updateLookup.Count)"
 $hostsWithCumulatives = ($hostCumulatives.Keys | Measure-Object).Count
 if ($hostsWithCumulatives -gt 0) {
     Write-Host "  Hosts with cumulative updates tracked: $hostsWithCumulatives" -ForegroundColor DarkCyan
+}
+
+# Build KB → cumulative info map so hotfix-only KBs can inherit cumulative metadata
+$knownCumulativeKBs = @{}
+foreach ($entries in $hostCumulatives.Values) {
+    foreach ($cum in $entries) {
+        if (-not $knownCumulativeKBs.ContainsKey($cum.KB)) {
+            $knownCumulativeKBs[$cum.KB] = @{
+                Product   = $cum.Product
+                YearMonth = $cum.YearMonth
+                Title     = $cum.Title
+            }
+        }
+    }
+}
+
+# Build KB → Title map from all_updates.csv (for product family detection in hotfix data)
+$kbTitleMap = @{}
+if ($hasTitle) {
+    foreach ($u in $updates) {
+        $kb = ($u.KB -replace '\s','').ToUpper()
+        if ($kb -and $u.Title -and -not $kbTitleMap.ContainsKey($kb)) {
+            $kbTitleMap[$kb] = $u.Title
+        }
+    }
 }
 
 # ============================================================================
@@ -280,6 +328,21 @@ if ($IncludePreviousLogs) {
 # READ INSTALLED_HOTFIXES.CSV (full hotfix history from Get-HotFix)
 # ============================================================================
 
+# Refresh known cumulatives map (previous logs may have added more)
+if ($IncludePreviousLogs) {
+    foreach ($entries in $hostCumulatives.Values) {
+        foreach ($cum in $entries) {
+            if (-not $knownCumulativeKBs.ContainsKey($cum.KB)) {
+                $knownCumulativeKBs[$cum.KB] = @{
+                    Product   = $cum.Product
+                    YearMonth = $cum.YearMonth
+                    Title     = $cum.Title
+                }
+            }
+        }
+    }
+}
+
 $sessionDir = if ($IncludePreviousLogs) { $sessionDir } else { Split-Path $UpdatesCsvPath -Parent }
 $hotfixCsvPath = Join-Path $sessionDir "installed_hotfixes.csv"
 if (Test-Path $hotfixCsvPath) {
@@ -287,6 +350,7 @@ if (Test-Path $hotfixCsvPath) {
     $hotfixData = Import-Csv $hotfixCsvPath
     $hfAdded = 0
     $hfSkipped = 0
+    $hfCumAdded = 0
     foreach ($hf in $hotfixData) {
         $kb = ($hf.KB -replace '\s','').ToUpper()
         if (-not $kb) { continue }
@@ -302,8 +366,59 @@ if (Test-Path $hotfixCsvPath) {
         } else {
             $hfSkipped++
         }
+
+        # If this KB is a known cumulative, track it for supersession on this host
+        if ($knownCumulativeKBs.ContainsKey($kb)) {
+            $cumInfo = $knownCumulativeKBs[$kb]
+            if (-not $hostCumulatives[$hfMatchKey]) { $hostCumulatives[$hfMatchKey] = @() }
+            $alreadyTracked = $hostCumulatives[$hfMatchKey] | Where-Object { $_.KB -eq $kb }
+            if (-not $alreadyTracked) {
+                $hostCumulatives[$hfMatchKey] += @{
+                    Product   = $cumInfo.Product
+                    YearMonth = $cumInfo.YearMonth
+                    KB        = $kb
+                    Title     = $cumInfo.Title
+                }
+                $hfCumAdded++
+            }
+        }
+        # Detect cumulatives from hotfix metadata (Description + InstalledOn)
+        # When the all_updates.csv Title lacks a date pattern (e.g. "Windows 11, version 25H2"),
+        # use the Get-HotFix InstalledOn date + Description="Security Update" to identify cumulatives
+        elseif ($hf.Description -eq 'Security Update' -and $hf.InstalledOn) {
+            $hfTitle = $kbTitleMap[$kb]
+            # Default to "Windows" when no title available — "Security Update" from Get-HotFix
+            # on Windows machines is the monthly cumulative rollup in the vast majority of cases.
+            # The InstalledOn date drives the actual supersession comparison.
+            $productFamily = if ($hfTitle) { Get-CumulativeProductFamily $hfTitle } else { "Windows" }
+            if ($productFamily -and $hf.InstalledOn -match '^(\d{4})-(\d{1,2})') {
+                $hfYearMonth = "{0}-{1:D2}" -f $Matches[1], [int]$Matches[2]
+                if (-not $hostCumulatives[$hfMatchKey]) { $hostCumulatives[$hfMatchKey] = @() }
+                $alreadyTracked = $hostCumulatives[$hfMatchKey] | Where-Object { $_.KB -eq $kb }
+                if (-not $alreadyTracked) {
+                    $hostCumulatives[$hfMatchKey] += @{
+                        Product   = $productFamily
+                        YearMonth = $hfYearMonth
+                        KB        = $kb
+                        Title     = if ($hfTitle) { $hfTitle } else { "Security Update $kb" }
+                    }
+                    $hfCumAdded++
+                    # Also register in knownCumulativeKBs so other hosts can inherit
+                    if (-not $knownCumulativeKBs.ContainsKey($kb)) {
+                        $knownCumulativeKBs[$kb] = @{
+                            Product   = $productFamily
+                            YearMonth = $hfYearMonth
+                            Title     = if ($hfTitle) { $hfTitle } else { "Security Update $kb" }
+                        }
+                    }
+                }
+            }
+        }
     }
     Write-Host "  Added $hfAdded KB entries from hotfix history (skipped $hfSkipped already known)"
+    if ($hfCumAdded -gt 0) {
+        Write-Host "  Cumulative supersession extended to $hfCumAdded additional host+KB combinations" -ForegroundColor DarkCyan
+    }
     Write-Host "  Total unique matchkey+KB combinations: $($updateLookup.Count)"
 } else {
     Write-Host "`n  No installed_hotfixes.csv found (run update script with latest version to generate)" -ForegroundColor DarkGray
@@ -330,6 +445,11 @@ if (Test-Path $computerSumPath2) {
         $deployIP = $cs.IP.Trim()
         if (-not $deployIP) { continue }
 
+        # Ensure friendly name (ComputerName from deployment CSV) is in the IP lookup
+        if ($cs.ComputerName -and -not $updateIPs[$deployIP]) {
+            $updateIPs[$deployIP] = $cs.ComputerName.Trim()
+        }
+
         # Build IP alias map: every IP on this machine maps back to the deployment IP
         if ($hasAllIPs -and $cs.AllIPAddresses) {
             $allIPs = $cs.AllIPAddresses -split ','
@@ -355,6 +475,54 @@ if (Test-Path $computerSumPath2) {
     }
     if ($hasMachineHostname) {
         Write-Host "  Machine hostnames loaded: $($machineHostnames.Count)"
+    }
+}
+
+# ============================================================================
+# SESSION-VERIFIED CUMULATIVE COVERAGE
+# When a host has Status=NoUpdatesNeeded or Completed but no cumulative tracked
+# in $hostCumulatives, use the session date as proof of coverage.
+# Get-HotFix (Win32_QuickFixEngineering) doesn't always list the latest
+# cumulative, but PSWindowsUpdate's status confirms the machine is current.
+# ============================================================================
+
+if ($sessionYearMonth -and (Test-Path $computerSumPath2)) {
+    $sessionVerified = 0
+    foreach ($cs in $compSummary) {
+        $csStatus = $cs.Status.Trim()
+        if ($csStatus -notin @('NoUpdatesNeeded', 'Completed')) { continue }
+
+        $deployIP = $cs.IP.Trim()
+        if (-not $deployIP) { continue }
+
+        # Only add if this host doesn't already have a Windows cumulative for the session month or newer
+        $existing = $hostCumulatives[$deployIP]
+        $alreadyCovered = $false
+        if ($existing) {
+            foreach ($cum in $existing) {
+                if ($cum.Product -eq 'Windows' -and $cum.YearMonth -ge $sessionYearMonth) {
+                    $alreadyCovered = $true
+                    break
+                }
+            }
+        }
+
+        if (-not $alreadyCovered) {
+            if (-not $hostCumulatives[$deployIP]) { $hostCumulatives[$deployIP] = @() }
+            $hostCumulatives[$deployIP] += @{
+                Product   = 'Windows'
+                YearMonth = $sessionYearMonth
+                KB        = '(session-verified)'
+                Title     = "Session status: $csStatus"
+            }
+            $sessionVerified++
+        }
+    }
+
+    if ($sessionVerified -gt 0) {
+        Write-Host "`n=== Session-verified cumulative coverage ===" -ForegroundColor Cyan
+        Write-Host "  $sessionVerified hosts verified current via session status (NoUpdatesNeeded/Completed)" -ForegroundColor DarkCyan
+        Write-Host "  Coverage month: $sessionYearMonth (from session folder name)" -ForegroundColor DarkCyan
     }
 }
 
@@ -473,6 +641,10 @@ try {
                         IP     = $singleIP
                         Reason = $colFText
                     }
+                    # Mark as seen in scan so deployment-side unmatched check doesn't double-list
+                    if (-not $vulnIPs.ContainsKey($singleIP)) {
+                        $vulnIPs[$singleIP] = "(no scan results)"
+                    }
                 }
             }
             continue
@@ -522,18 +694,18 @@ try {
 
         # Extract date context from this row and map to KBs
         $rowDateMonth = $null
-        # Try Results column: YYYY-MM pattern
-        if ($results -match '(\d{4})-(\d{1,2})') {
-            $rowDateMonth = "{0}-{1:D2}" -f $Matches[1], [int]$Matches[2]
-        }
-        # Try title: "Month YYYY" pattern
-        if (-not $rowDateMonth -and $title -match '(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})') {
+        # Try title first: "Month YYYY" pattern (most reliable — never contains CVE numbers)
+        if ($title -match '(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})') {
             $mName = $Matches[1].ToLower()
             $yr = $Matches[2]
             $rowDateMonth = "{0}-{1:D2}" -f $yr, $monthNames[$mName]
         }
-        # Try Solution column: YYYY-MM pattern
-        if (-not $rowDateMonth -and $solution -match '(\d{4})-(\d{1,2})') {
+        # Try Results column: YYYY-MM pattern (validate month 1-12 to exclude CVE numbers like CVE-2026-20805)
+        if (-not $rowDateMonth -and $results -match '(\d{4})-(\d{1,2})' -and [int]$Matches[2] -ge 1 -and [int]$Matches[2] -le 12) {
+            $rowDateMonth = "{0}-{1:D2}" -f $Matches[1], [int]$Matches[2]
+        }
+        # Try Solution column: YYYY-MM pattern (validate month 1-12)
+        if (-not $rowDateMonth -and $solution -match '(\d{4})-(\d{1,2})' -and [int]$Matches[2] -ge 1 -and [int]$Matches[2] -le 12) {
             $rowDateMonth = "{0}-{1:D2}" -f $Matches[1], [int]$Matches[2]
         }
 
@@ -591,20 +763,23 @@ try {
                         # Use global KB date map (populated across ALL Qualys entries)
                         $kbDateMonth = $kbDateMap[$kb]
 
-                        # Fallback: try row-specific date extraction
-                        if (-not $kbDateMonth) {
-                            if ($row.Results -match "(\d{4})-(\d{1,2}).*$([regex]::Escape($kb))|$([regex]::Escape($kb)).*(\d{4})-(\d{1,2})") {
-                                $year = if ($Matches[1]) { $Matches[1] } else { $Matches[3] }
-                                $month = if ($Matches[2]) { $Matches[2] } else { $Matches[4] }
-                                $kbDateMonth = "{0}-{1:D2}" -f $year, [int]$month
-                            }
-                        }
+                        # Fallback: try row-specific date extraction (Title first, most reliable)
                         if (-not $kbDateMonth -and $row.Title -match '(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})') {
                             $mName = $Matches[1].ToLower()
                             $yr = $Matches[2]
                             $kbDateMonth = "{0}-{1:D2}" -f $yr, $monthNames[$mName]
                         }
-                        if (-not $kbDateMonth -and $row.Solution -match '(\d{4})-(\d{1,2})') {
+                        if (-not $kbDateMonth) {
+                            if ($row.Results -match "(\d{4})-(\d{1,2}).*$([regex]::Escape($kb))|$([regex]::Escape($kb)).*(\d{4})-(\d{1,2})") {
+                                $year = if ($Matches[1]) { $Matches[1] } else { $Matches[3] }
+                                $month = if ($Matches[2]) { $Matches[2] } else { $Matches[4] }
+                                # Validate month 1-12 to exclude CVE numbers (e.g. CVE-2026-20805)
+                                if ([int]$month -ge 1 -and [int]$month -le 12) {
+                                    $kbDateMonth = "{0}-{1:D2}" -f $year, [int]$month
+                                }
+                            }
+                        }
+                        if (-not $kbDateMonth -and $row.Solution -match '(\d{4})-(\d{1,2})' -and [int]$Matches[2] -ge 1 -and [int]$Matches[2] -le 12) {
                             $kbDateMonth = "{0}-{1:D2}" -f $Matches[1], [int]$Matches[2]
                         }
 
@@ -735,8 +910,12 @@ foreach ($g in $groupedByIP) {
     if ($manualItems.Count -gt 0) { $outstandingParts += $manualItems -join "; " }
     $missingKBsStr = $outstandingParts -join " | "
 
+    # Look up the friendly site name from deployment CSV
+    $siteName = if ($updateIPs[$groupIP]) { $updateIPs[$groupIP] } else { "" }
+
     $hostSummary += [PSCustomObject]@{
         Hostname         = $displayName
+        SiteName         = $siteName
         IP               = $groupIP
         TotalVulns       = $total
         Remediated       = $remediated
@@ -812,7 +991,7 @@ try {
     # --- Sheet 1: Host Summary ---
     $ws1 = $outWb.Sheets.Item(1)
     $ws1.Name = "Host Summary"
-    $headers1 = @("Hostname", "IP", "Total Vulns", "Remediated", "Remediated (Cumulative)", "Not Remediated", "Manual Review", "% Remediated", "Latest Cumulative", "Outstanding Items")
+    $headers1 = @("Hostname", "Site Name", "IP", "Total Vulns", "Remediated", "Remediated (Cumulative)", "Not Remediated", "Manual Review", "% Remediated", "Latest Cumulative", "Outstanding Items")
     for ($c = 0; $c -lt $headers1.Count; $c++) {
         $ws1.Cells.Item(1, $c + 1) = $headers1[$c]
         $ws1.Cells.Item(1, $c + 1).Font.Bold = $true
@@ -822,28 +1001,29 @@ try {
     $row = 2
     foreach ($h in $hostSummary) {
         $ws1.Cells.Item($row, 1) = $h.Hostname
-        $ws1.Cells.Item($row, 2) = $h.IP
-        $ws1.Cells.Item($row, 3) = $h.TotalVulns
-        $ws1.Cells.Item($row, 4) = $h.Remediated
-        $ws1.Cells.Item($row, 5) = $h.CumRemediated
-        $ws1.Cells.Item($row, 6) = $h.NotRemediated
-        $ws1.Cells.Item($row, 7) = $h.ManualReview
-        $ws1.Cells.Item($row, 8) = "$($h.PctRemediated)%"
-        $ws1.Cells.Item($row, 9) = $h.LatestCumulative
-        $ws1.Cells.Item($row, 10) = $h.MissingKBs
+        $ws1.Cells.Item($row, 2) = $h.SiteName
+        $ws1.Cells.Item($row, 3) = $h.IP
+        $ws1.Cells.Item($row, 4) = $h.TotalVulns
+        $ws1.Cells.Item($row, 5) = $h.Remediated
+        $ws1.Cells.Item($row, 6) = $h.CumRemediated
+        $ws1.Cells.Item($row, 7) = $h.NotRemediated
+        $ws1.Cells.Item($row, 8) = $h.ManualReview
+        $ws1.Cells.Item($row, 9) = "$($h.PctRemediated)%"
+        $ws1.Cells.Item($row, 10) = $h.LatestCumulative
+        $ws1.Cells.Item($row, 11) = $h.MissingKBs
         # Color code the % column
         if ($h.PctRemediated -ge 90) {
-            $ws1.Cells.Item($row, 8).Interior.Color = 0x90EE90  # Light green
+            $ws1.Cells.Item($row, 9).Interior.Color = 0x90EE90  # Light green
         } elseif ($h.PctRemediated -ge 50) {
-            $ws1.Cells.Item($row, 8).Interior.Color = 0xADDCFF  # Light yellow (BGR)
+            $ws1.Cells.Item($row, 9).Interior.Color = 0xADDCFF  # Light yellow (BGR)
         } else {
-            $ws1.Cells.Item($row, 8).Interior.Color = 0x8080FF  # Light red (BGR)
+            $ws1.Cells.Item($row, 9).Interior.Color = 0x8080FF  # Light red (BGR)
         }
         $row++
     }
-    $ws1.Columns.Item("A:J").AutoFit() | Out-Null
-    # Cap Missing KBs column width so it doesn't get absurdly wide
-    if ($ws1.Columns.Item("J").ColumnWidth -gt 80) { $ws1.Columns.Item("J").ColumnWidth = 80 }
+    $ws1.Columns.Item("A:K").AutoFit() | Out-Null
+    # Cap Outstanding Items column width so it doesn't get absurdly wide
+    if ($ws1.Columns.Item("K").ColumnWidth -gt 80) { $ws1.Columns.Item("K").ColumnWidth = 80 }
 
     # --- Sheet 2: Vulnerability Detail ---
     $ws2 = $outWb.Sheets.Add([System.Reflection.Missing]::Value, $ws1)
