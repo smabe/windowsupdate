@@ -1118,6 +1118,9 @@ try {
         $outWb.Sheets.Item($outWb.Sheets.Count).Delete()
     }
 
+    # Select the first sheet (Host Summary) so the report opens on it
+    $outWb.Sheets.Item(1).Activate()
+
     # Save
     if (Test-Path $OutputPath) { Remove-Item $OutputPath -Force }
     $outWb.SaveAs($OutputPath, 51)  # 51 = xlOpenXMLWorkbook (.xlsx)
