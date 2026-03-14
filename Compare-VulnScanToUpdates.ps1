@@ -1,24 +1,23 @@
 <#
 .SYNOPSIS
-    Correlates a Qualys vulnerability scan report (XLSX) with Windows Update installation results (all_updates.csv).
+    Correlates a Qualys vulnerability scan report with Windows Update deployment results.
 
 .DESCRIPTION
-    Reads a Qualys scan report and the all_updates.csv output from the Windows Update script,
-    then determines which vulnerabilities have been remediated by installed updates.
+    Point this script at a folder containing a Qualys scan report (Scan_Report_NVR__*.xlsx)
+    and a Session_* subfolder from the Windows Update deployment script. It auto-discovers
+    the necessary files, correlates vulnerabilities against installed updates, and produces
+    a remediation report.
+
     Supports cumulative update supersession — if a host has a newer cumulative update installed
     (e.g., 2026-03) than the missing KB's month (e.g., 2025-12), the vulnerability is marked
     "Remediated (Cumulative)" rather than "Not Remediated".
-    Produces an XLSX report with Host Summary, Vulnerability Detail, Unmatched Hosts,
-    and Cumulative Coverage sheets.
 
-.PARAMETER VulnReportPath
-    Path to the Qualys vulnerability scan XLSX file.
-
-.PARAMETER UpdatesCsvPath
-    Path to the all_updates.csv file from the Windows Update script.
+.PARAMETER Path
+    Folder containing the Qualys XLSX (Scan_Report_NVR__*.xlsx) and a Session_* subfolder
+    with all_updates.csv, computer_summary.csv, installed_hotfixes.csv, etc.
 
 .PARAMETER OutputPath
-    Path for the output report. Defaults to the same directory as the vuln report.
+    Path for the output report. Defaults to the input folder.
 
 .PARAMETER ExportCsv
     Also export a detailed CSV alongside the XLSX report.
@@ -27,15 +26,17 @@
     Which vuln report column to use for hostname matching: "DNS" (col 3) or "NetBIOS" (col 4).
     Default: DNS, with fallback to NetBIOS if DNS is empty.
 
-.EXAMPLE
-    .\Compare-VulnScanToUpdates.ps1 -VulnReportPath ".\scan_report.xlsx" -UpdatesCsvPath ".\all_updates.csv"
+.PARAMETER IncludePreviousLogs
+    Also read previous_updatelog_*.csv files from the session directory.
 
 .EXAMPLE
-    .\Compare-VulnScanToUpdates.ps1 -VulnReportPath ".\scan_report.xlsx" -UpdatesCsvPath ".\all_updates.csv" -ExportCsv
+    .\Compare-VulnScanToUpdates.ps1 -Path "C:\temp"
+
+.EXAMPLE
+    .\Compare-VulnScanToUpdates.ps1 -Path "C:\temp" -ExportCsv -IncludePreviousLogs
 #>
 param(
-    [Parameter(Mandatory)][string]$VulnReportPath,
-    [Parameter(Mandatory)][string]$UpdatesCsvPath,
+    [Parameter(Mandatory)][string]$Path,
     [string]$OutputPath,
     [switch]$ExportCsv,
     [ValidateSet("DNS","NetBIOS")][string]$HostnameColumn = "DNS",
@@ -43,25 +44,49 @@ param(
 )
 
 # ============================================================================
-# VALIDATION
+# FILE DISCOVERY
 # ============================================================================
 
-if (-not (Test-Path $VulnReportPath)) {
-    Write-Host "ERROR: Vulnerability report not found: $VulnReportPath" -ForegroundColor Red
+if (-not (Test-Path $Path -PathType Container)) {
+    Write-Host "ERROR: Folder not found: $Path" -ForegroundColor Red
     exit 1
 }
-if (-not (Test-Path $UpdatesCsvPath)) {
-    Write-Host "ERROR: Updates CSV not found: $UpdatesCsvPath" -ForegroundColor Red
+$Path = (Resolve-Path $Path).Path
+
+# Find Qualys report
+$vulnFiles = @(Get-ChildItem $Path -Filter "Scan_Report_NVR__*.xlsx" -File)
+if ($vulnFiles.Count -eq 0) {
+    Write-Host "ERROR: No Qualys report (Scan_Report_NVR__*.xlsx) found in: $Path" -ForegroundColor Red
     exit 1
+}
+$VulnReportPath = ($vulnFiles | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+if ($vulnFiles.Count -gt 1) {
+    Write-Host "  Multiple Qualys reports found — using most recent: $(Split-Path $VulnReportPath -Leaf)" -ForegroundColor Yellow
 }
 
-$VulnReportPath = (Resolve-Path $VulnReportPath).Path
-$UpdatesCsvPath = (Resolve-Path $UpdatesCsvPath).Path
+# Find session folder
+$sessionDirs = @(Get-ChildItem $Path -Directory -Filter "Session_*")
+if ($sessionDirs.Count -eq 0) {
+    Write-Host "ERROR: No Session_* folder found in: $Path" -ForegroundColor Red
+    exit 1
+}
+$sessionFolder = $sessionDirs | Sort-Object Name -Descending | Select-Object -First 1
+$UpdatesCsvPath = Join-Path $sessionFolder.FullName "all_updates.csv"
+if (-not (Test-Path $UpdatesCsvPath)) {
+    Write-Host "ERROR: all_updates.csv not found in: $($sessionFolder.FullName)" -ForegroundColor Red
+    exit 1
+}
+if ($sessionDirs.Count -gt 1) {
+    Write-Host "  Multiple session folders found — using most recent: $($sessionFolder.Name)" -ForegroundColor Yellow
+}
+
+Write-Host "=== File Discovery ===" -ForegroundColor Cyan
+Write-Host "  Qualys report  : $(Split-Path $VulnReportPath -Leaf)"
+Write-Host "  Session folder : $($sessionFolder.Name)"
 
 if (-not $OutputPath) {
-    $dir = Split-Path $VulnReportPath -Parent
     $baseName = [System.IO.Path]::GetFileNameWithoutExtension($VulnReportPath)
-    $OutputPath = Join-Path $dir "${baseName}_Remediation_Report.xlsx"
+    $OutputPath = Join-Path $Path "${baseName}_Remediation_Report.xlsx"
 }
 # Excel COM requires absolute paths for SaveAs
 $OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
