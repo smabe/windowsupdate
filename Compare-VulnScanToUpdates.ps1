@@ -835,6 +835,7 @@ try {
             RequiredKBs       = ($requiredKBs -join ", ")
             RemediationStatus = $remediationStatus
             KBDetails         = ($kbDetails -join "; ")
+            Solution          = $row.Solution
         }
     }
 
@@ -910,6 +911,16 @@ foreach ($g in $groupedByIP) {
     if ($manualItems.Count -gt 0) { $outstandingParts += $manualItems -join "; " }
     $missingKBsStr = $outstandingParts -join " | "
 
+    # Collect unique resolution/solution text from unresolved entries (Not Remediated + Manual Review)
+    $resolutionItems = @()
+    $unresolvedEntries = $g.Group | Where-Object { $_.RemediationStatus -in @("Not Remediated", "Manual Review") }
+    foreach ($ure in $unresolvedEntries) {
+        if ($ure.Solution -and $resolutionItems -notcontains $ure.Solution) {
+            $resolutionItems += $ure.Solution
+        }
+    }
+    $resolutionStr = $resolutionItems -join " | "
+
     # Look up the friendly site name from deployment CSV
     $siteName = if ($updateIPs[$groupIP]) { $updateIPs[$groupIP] } else { "" }
 
@@ -925,6 +936,7 @@ foreach ($g in $groupedByIP) {
         PctRemediated    = $pct
         LatestCumulative = $latestCum
         MissingKBs       = $missingKBsStr
+        Resolution       = $resolutionStr
     }
 }
 $hostSummary = $hostSummary | Sort-Object PctRemediated
@@ -991,7 +1003,7 @@ try {
     # --- Sheet 1: Host Summary ---
     $ws1 = $outWb.Sheets.Item(1)
     $ws1.Name = "Host Summary"
-    $headers1 = @("Hostname", "Site Name", "IP", "Total Vulns", "Remediated", "Remediated (Cumulative)", "Not Remediated", "Manual Review", "% Remediated", "Latest Cumulative", "Outstanding Items")
+    $headers1 = @("Hostname", "Site Name", "IP", "Total Vulns", "Remediated", "Remediated (Cumulative)", "Not Remediated", "Manual Review", "% Remediated", "Latest Cumulative", "Outstanding Items", "Resolution")
     for ($c = 0; $c -lt $headers1.Count; $c++) {
         $ws1.Cells.Item(1, $c + 1) = $headers1[$c]
         $ws1.Cells.Item(1, $c + 1).Font.Bold = $true
@@ -1011,6 +1023,7 @@ try {
         $ws1.Cells.Item($row, 9) = "$($h.PctRemediated)%"
         $ws1.Cells.Item($row, 10) = $h.LatestCumulative
         $ws1.Cells.Item($row, 11) = $h.MissingKBs
+        $ws1.Cells.Item($row, 12) = $h.Resolution
         # Color code the % column
         if ($h.PctRemediated -ge 90) {
             $ws1.Cells.Item($row, 9).Interior.Color = 0x90EE90  # Light green
@@ -1021,100 +1034,38 @@ try {
         }
         $row++
     }
-    $ws1.Columns.Item("A:K").AutoFit() | Out-Null
-    # Cap Outstanding Items column width so it doesn't get absurdly wide
+    $ws1.Columns.Item("A:L").AutoFit() | Out-Null
+    # Cap Outstanding Items and Resolution column widths so they don't get absurdly wide
     if ($ws1.Columns.Item("K").ColumnWidth -gt 80) { $ws1.Columns.Item("K").ColumnWidth = 80 }
+    if ($ws1.Columns.Item("L").ColumnWidth -gt 80) { $ws1.Columns.Item("L").ColumnWidth = 80 }
 
-    # --- Sheet 2: Vulnerability Detail ---
+    # --- Sheet 2: Unmatched Hosts ---
     $ws2 = $outWb.Sheets.Add([System.Reflection.Missing]::Value, $ws1)
-    $ws2.Name = "Vulnerability Detail"
-    $headers2 = @("Hostname", "IP", "CVE", "Title", "Severity", "Required KBs", "Remediation Status", "KB Details")
+    $ws2.Name = "Unmatched Hosts"
+    $headers2 = @("Hostname", "IP", "Source", "Note")
     for ($c = 0; $c -lt $headers2.Count; $c++) {
         $ws2.Cells.Item(1, $c + 1) = $headers2[$c]
         $ws2.Cells.Item(1, $c + 1).Font.Bold = $true
         $ws2.Cells.Item(1, $c + 1).Interior.Color = 0x783C28
         $ws2.Cells.Item(1, $c + 1).Font.Color = 0xFFFFFF
     }
-    $row = 2
-    foreach ($v in ($vulnData | Sort-Object Hostname, Severity, CVE)) {
-        $ws2.Cells.Item($row, 1) = $v.Hostname
-        $ws2.Cells.Item($row, 2) = $v.IP
-        $ws2.Cells.Item($row, 3) = $v.CVE
-        $ws2.Cells.Item($row, 4) = $v.Title
-        $ws2.Cells.Item($row, 5) = $v.Severity
-        $ws2.Cells.Item($row, 6) = $v.RequiredKBs
-        $ws2.Cells.Item($row, 7) = $v.RemediationStatus
-        $ws2.Cells.Item($row, 8) = $v.KBDetails
-        # Color code status
-        switch ($v.RemediationStatus) {
-            "Remediated"              { $ws2.Cells.Item($row, 7).Interior.Color = 0x90EE90 }  # Green
-            "Remediated (Cumulative)" { $ws2.Cells.Item($row, 7).Interior.Color = 0xFFE0B0 }  # Light blue (BGR)
-            "Not Remediated"          { $ws2.Cells.Item($row, 7).Interior.Color = 0x8080FF }  # Red
-            "Manual Review"           { $ws2.Cells.Item($row, 7).Interior.Color = 0xADDCFF }  # Yellow
-        }
-        $row++
-    }
-    $ws2.Columns.Item("A:H").AutoFit() | Out-Null
-    # Cap column D (Title) width
-    if ($ws2.Columns.Item("D").ColumnWidth -gt 60) { $ws2.Columns.Item("D").ColumnWidth = 60 }
-
-    # --- Sheet 3: Unmatched Hosts ---
-    $ws3 = $outWb.Sheets.Add([System.Reflection.Missing]::Value, $ws2)
-    $ws3.Name = "Unmatched Hosts"
-    $headers3 = @("Hostname", "IP", "Source", "Note")
-    for ($c = 0; $c -lt $headers3.Count; $c++) {
-        $ws3.Cells.Item(1, $c + 1) = $headers3[$c]
-        $ws3.Cells.Item(1, $c + 1).Font.Bold = $true
-        $ws3.Cells.Item(1, $c + 1).Interior.Color = 0x783C28
-        $ws3.Cells.Item(1, $c + 1).Font.Color = 0xFFFFFF
-    }
     if ($unmatchedAll.Count -gt 0) {
         $row = 2
         foreach ($u in $unmatchedAll) {
-            $ws3.Cells.Item($row, 1) = $u.Hostname
-            $ws3.Cells.Item($row, 2) = $u.IP
-            $ws3.Cells.Item($row, 3) = $u.Source
-            $ws3.Cells.Item($row, 4) = $u.Note
+            $ws2.Cells.Item($row, 1) = $u.Hostname
+            $ws2.Cells.Item($row, 2) = $u.IP
+            $ws2.Cells.Item($row, 3) = $u.Source
+            $ws2.Cells.Item($row, 4) = $u.Note
             $row++
         }
     } else {
-        $ws3.Cells.Item(2, 1) = "All hosts matched successfully"
-        $ws3.Cells.Item(2, 1).Font.Color = 0x008000
+        $ws2.Cells.Item(2, 1) = "All hosts matched successfully"
+        $ws2.Cells.Item(2, 1).Font.Color = 0x008000
     }
-    $ws3.Columns.Item("A:D").AutoFit() | Out-Null
-
-    # --- Sheet 4: Cumulative Coverage ---
-    $ws4 = $outWb.Sheets.Add([System.Reflection.Missing]::Value, $ws3)
-    $ws4.Name = "Cumulative Coverage"
-    $headers4 = @("Hostname", "Product Family", "Year-Month", "KB", "Title")
-    for ($c = 0; $c -lt $headers4.Count; $c++) {
-        $ws4.Cells.Item(1, $c + 1) = $headers4[$c]
-        $ws4.Cells.Item(1, $c + 1).Font.Bold = $true
-        $ws4.Cells.Item(1, $c + 1).Interior.Color = 0x783C28
-        $ws4.Cells.Item(1, $c + 1).Font.Color = 0xFFFFFF
-    }
-    $row = 2
-    $cumDataWritten = $false
-    foreach ($hostKey in ($hostCumulatives.Keys | Sort-Object)) {
-        foreach ($cum in ($hostCumulatives[$hostKey] | Sort-Object { $_.YearMonth } -Descending)) {
-            $ws4.Cells.Item($row, 1) = $hostKey
-            $ws4.Cells.Item($row, 2) = $cum.Product
-            $ws4.Cells.Item($row, 3) = $cum.YearMonth
-            $ws4.Cells.Item($row, 4) = $cum.KB
-            $ws4.Cells.Item($row, 5) = $cum.Title
-            $row++
-            $cumDataWritten = $true
-        }
-    }
-    if (-not $cumDataWritten) {
-        $ws4.Cells.Item(2, 1) = "No cumulative updates found in all_updates.csv"
-        $ws4.Cells.Item(2, 1).Font.Color = 0x0000FF
-    }
-    $ws4.Columns.Item("A:E").AutoFit() | Out-Null
-    if ($ws4.Columns.Item("E").ColumnWidth -gt 80) { $ws4.Columns.Item("E").ColumnWidth = 80 }
+    $ws2.Columns.Item("A:D").AutoFit() | Out-Null
 
     # Remove any extra default sheets
-    while ($outWb.Sheets.Count -gt 4) {
+    while ($outWb.Sheets.Count -gt 2) {
         $outWb.Sheets.Item($outWb.Sheets.Count).Delete()
     }
 

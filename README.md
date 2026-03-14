@@ -276,13 +276,11 @@ Windows cumulative updates supersede all prior monthly patches. The script uses 
 
 ### Output
 
-4-sheet XLSX report:
+2-sheet XLSX report:
 | Sheet | Contents |
 |---|---|
-| **Host Summary** | Per-host totals, % remediated (color-coded), site name, latest cumulative, outstanding items (missing KBs + manual review vulns) |
-| **Vulnerability Detail** | Every vulnerability with remediation status, required KBs, and match details |
+| **Host Summary** | Per-host totals, % remediated (color-coded), site name, latest cumulative, outstanding items (missing KBs + manual review vulns), and resolution details from Qualys for unresolved vulnerabilities |
 | **Unmatched Hosts** | Hosts in one dataset but not the other (data quality check) |
-| **Cumulative Coverage** | All cumulative updates detected per host with product family and date |
 
 ### Expected Qualys XLSX Columns
 
