@@ -968,21 +968,20 @@ foreach ($vip in $vulnIPs.Keys) {
         # Resolve through IP aliases to find deployment site name
         $resolvedIP = if ($ipAliases[$vip]) { $ipAliases[$vip] } else { $vip }
         $sn = if ($updateIPs[$resolvedIP]) { $updateIPs[$resolvedIP] } else { "" }
-        $unmatchedVuln += [PSCustomObject]@{ Hostname = $vulnIPs[$vip]; SiteName = $sn; IP = $vip; Source = "Vuln Scan"; Note = "No matching IP in all_updates.csv" }
+        $unmatchedVuln += [PSCustomObject]@{ SiteName = $sn; IP = $vip; Source = "Vuln Scan"; Note = "No matching IP in all_updates.csv" }
     }
 }
 foreach ($uip in $updateIPs.Keys) {
     if ($uip -and -not $vulnIPs[$uip]) {
-        $unmatchedUpdate += [PSCustomObject]@{ Hostname = $updateIPs[$uip]; SiteName = $updateIPs[$uip]; IP = $uip; Source = "Updates CSV"; Note = "No matching IP in vuln scan" }
+        $unmatchedUpdate += [PSCustomObject]@{ SiteName = $updateIPs[$uip]; IP = $uip; Source = "Updates CSV"; Note = "No matching IP in vuln scan" }
     }
 }
 # Add "No results" hosts from Qualys summary rows
 $unmatchedNoResults = @()
 foreach ($nrh in $noResultsHosts) {
     $resolvedIP = if ($ipAliases[$nrh.IP]) { $ipAliases[$nrh.IP] } else { $nrh.IP }
-    $hn = if ($vulnIPs[$nrh.IP]) { $vulnIPs[$nrh.IP] } else { "" }
     $sn = if ($updateIPs[$resolvedIP]) { $updateIPs[$resolvedIP] } else { "" }
-    $unmatchedNoResults += [PSCustomObject]@{ Hostname = $hn; SiteName = $sn; IP = $nrh.IP; Source = "Vuln Scan"; Note = $nrh.Reason }
+    $unmatchedNoResults += [PSCustomObject]@{ SiteName = $sn; IP = $nrh.IP; Source = "Vuln Scan"; Note = $nrh.Reason }
 }
 $unmatchedAll = $unmatchedVuln + $unmatchedUpdate + $unmatchedNoResults
 
@@ -1068,7 +1067,7 @@ try {
     # --- Sheet 2: Unmatched Hosts ---
     $ws2 = $outWb.Sheets.Add([System.Reflection.Missing]::Value, $ws1)
     $ws2.Name = "Unmatched Hosts"
-    $headers2 = @("Hostname", "Site Name", "IP", "Source", "Note")
+    $headers2 = @("Site Name", "IP", "Source", "Note")
     for ($c = 0; $c -lt $headers2.Count; $c++) {
         $ws2.Cells.Item(1, $c + 1) = $headers2[$c]
         $ws2.Cells.Item(1, $c + 1).Font.Bold = $true
@@ -1078,11 +1077,10 @@ try {
     if ($unmatchedAll.Count -gt 0) {
         $row = 2
         foreach ($u in $unmatchedAll) {
-            $ws2.Cells.Item($row, 1) = $u.Hostname
-            $ws2.Cells.Item($row, 2) = $u.SiteName
-            $ws2.Cells.Item($row, 3) = $u.IP
-            $ws2.Cells.Item($row, 4) = $u.Source
-            $ws2.Cells.Item($row, 5) = $u.Note
+            $ws2.Cells.Item($row, 1) = $u.SiteName
+            $ws2.Cells.Item($row, 2) = $u.IP
+            $ws2.Cells.Item($row, 3) = $u.Source
+            $ws2.Cells.Item($row, 4) = $u.Note
             $row++
         }
     } else {
@@ -1090,7 +1088,7 @@ try {
         $ws2.Cells.Item(2, 1).Font.Color = 0x008000
     }
     $ws2.Cells.WrapText = $false
-    $ws2.Columns.Item("A:E").AutoFit() | Out-Null
+    $ws2.Columns.Item("A:D").AutoFit() | Out-Null
 
     # Remove any extra default sheets
     while ($outWb.Sheets.Count -gt 2) {
