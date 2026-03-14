@@ -3,21 +3,23 @@
     Correlates a Qualys vulnerability scan report with Windows Update deployment results.
 
 .DESCRIPTION
-    Point this script at a folder containing a Qualys scan report (Scan_Report_NVR__*.xlsx)
-    and a Session_* subfolder from the Windows Update deployment script. It auto-discovers
-    the necessary files, correlates vulnerabilities against installed updates, and produces
-    a remediation report.
+    Point this script at a session folder from the Windows Update deployment script.
+    Place the Qualys scan report (Scan_Report_NVR__*.xlsx) in the same folder alongside
+    all_updates.csv, computer_summary.csv, installed_hotfixes.csv, etc.
+
+    The script auto-discovers the Qualys report and session data files, correlates
+    vulnerabilities against installed updates, and produces a remediation report.
 
     Supports cumulative update supersession — if a host has a newer cumulative update installed
     (e.g., 2026-03) than the missing KB's month (e.g., 2025-12), the vulnerability is marked
     "Remediated (Cumulative)" rather than "Not Remediated".
 
 .PARAMETER Path
-    Folder containing the Qualys XLSX (Scan_Report_NVR__*.xlsx) and a Session_* subfolder
-    with all_updates.csv, computer_summary.csv, installed_hotfixes.csv, etc.
+    Session folder containing the Qualys XLSX (Scan_Report_NVR__*.xlsx) and deployment
+    data files (all_updates.csv, computer_summary.csv, installed_hotfixes.csv, etc.).
 
 .PARAMETER OutputPath
-    Path for the output report. Defaults to the input folder.
+    Path for the output report. Defaults to the session folder.
 
 .PARAMETER ExportCsv
     Also export a detailed CSV alongside the XLSX report.
@@ -30,10 +32,10 @@
     Also read previous_updatelog_*.csv files from the session directory.
 
 .EXAMPLE
-    .\Compare-VulnScanToUpdates.ps1 -Path "C:\temp"
+    .\Compare-VulnScanToUpdates.ps1 -Path "C:\temp\Session_20260313_221433"
 
 .EXAMPLE
-    .\Compare-VulnScanToUpdates.ps1 -Path "C:\temp" -ExportCsv -IncludePreviousLogs
+    .\Compare-VulnScanToUpdates.ps1 -Path "C:\temp\Session_20260313_221433" -ExportCsv -IncludePreviousLogs
 #>
 param(
     [Parameter(Mandatory)][string]$Path,
@@ -53,8 +55,9 @@ if (-not (Test-Path $Path -PathType Container)) {
 }
 $Path = (Resolve-Path $Path).Path
 
-# Find Qualys report
-$vulnFiles = @(Get-ChildItem $Path -Filter "Scan_Report_NVR__*.xlsx" -File)
+# Find Qualys report (exclude our own output files)
+$vulnFiles = @(Get-ChildItem $Path -Filter "Scan_Report_NVR__*.xlsx" -File |
+    Where-Object { $_.Name -notlike "*_Remediation_Report.xlsx" })
 if ($vulnFiles.Count -eq 0) {
     Write-Host "ERROR: No Qualys report (Scan_Report_NVR__*.xlsx) found in: $Path" -ForegroundColor Red
     exit 1
@@ -64,25 +67,16 @@ if ($vulnFiles.Count -gt 1) {
     Write-Host "  Multiple Qualys reports found — using most recent: $(Split-Path $VulnReportPath -Leaf)" -ForegroundColor Yellow
 }
 
-# Find session folder
-$sessionDirs = @(Get-ChildItem $Path -Directory -Filter "Session_*")
-if ($sessionDirs.Count -eq 0) {
-    Write-Host "ERROR: No Session_* folder found in: $Path" -ForegroundColor Red
-    exit 1
-}
-$sessionFolder = $sessionDirs | Sort-Object Name -Descending | Select-Object -First 1
-$UpdatesCsvPath = Join-Path $sessionFolder.FullName "all_updates.csv"
+# Verify session data files
+$UpdatesCsvPath = Join-Path $Path "all_updates.csv"
 if (-not (Test-Path $UpdatesCsvPath)) {
-    Write-Host "ERROR: all_updates.csv not found in: $($sessionFolder.FullName)" -ForegroundColor Red
+    Write-Host "ERROR: all_updates.csv not found in: $Path" -ForegroundColor Red
     exit 1
-}
-if ($sessionDirs.Count -gt 1) {
-    Write-Host "  Multiple session folders found — using most recent: $($sessionFolder.Name)" -ForegroundColor Yellow
 }
 
 Write-Host "=== File Discovery ===" -ForegroundColor Cyan
-Write-Host "  Qualys report  : $(Split-Path $VulnReportPath -Leaf)"
-Write-Host "  Session folder : $($sessionFolder.Name)"
+Write-Host "  Qualys report : $(Split-Path $VulnReportPath -Leaf)"
+Write-Host "  Session folder: $(Split-Path $Path -Leaf)"
 
 if (-not $OutputPath) {
     $baseName = [System.IO.Path]::GetFileNameWithoutExtension($VulnReportPath)

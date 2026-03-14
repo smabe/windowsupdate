@@ -232,20 +232,20 @@ Phase 3 uses batched operations for fast collection across large fleets:
 ### Usage
 
 ```powershell
-# Point at a folder containing the Qualys XLSX and Session_* subfolder
-.\Compare-VulnScanToUpdates.ps1 -Path "C:\temp"
+# Point at a session folder (place the Qualys XLSX inside it)
+.\Compare-VulnScanToUpdates.ps1 -Path "C:\temp\Session_20260313_221433"
 
 # Include data from previous deployment runs
-.\Compare-VulnScanToUpdates.ps1 -Path "C:\temp" -IncludePreviousLogs
+.\Compare-VulnScanToUpdates.ps1 -Path "C:\temp\Session_20260313_221433" -IncludePreviousLogs
 
 # Also export a CSV alongside the XLSX report
-.\Compare-VulnScanToUpdates.ps1 -Path "C:\temp" -ExportCsv
+.\Compare-VulnScanToUpdates.ps1 -Path "C:\temp\Session_20260313_221433" -ExportCsv
 
 # Use NetBIOS instead of DNS for hostname display
-.\Compare-VulnScanToUpdates.ps1 -Path "C:\temp" -HostnameColumn NetBIOS
+.\Compare-VulnScanToUpdates.ps1 -Path "C:\temp\Session_20260313_221433" -HostnameColumn NetBIOS
 ```
 
-The script auto-discovers `Scan_Report_NVR__*.xlsx` and the most recent `Session_*` subfolder. If multiple are found, it uses the most recent.
+Place the Qualys scan report (`Scan_Report_NVR__*.xlsx`) in the session folder alongside `all_updates.csv`. The script auto-discovers it.
 
 ### How It Works
 
