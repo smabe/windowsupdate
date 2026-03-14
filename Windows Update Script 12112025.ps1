@@ -342,7 +342,12 @@ function Wait-ForUpdateJobs {
 
         # Max retry attempts for a stuck "Waiting to start" machine before releasing as JobStartFailed
         [Parameter(Mandatory=$false)]
-        [int]$MaxJobStartRetries = 3
+        [int]$MaxJobStartRetries = 3,
+
+        # Minutes a machine may stay in "Running (Processes)" before warning (stall detection)
+        # Auto-release as "Stalled" at 2x this value (default: warn at 15m, release at 30m)
+        [Parameter(Mandatory=$false)]
+        [int]$RunningStallMinutes = 15
     )
     Write-Host "`n═══ Monitoring Update Jobs ═══" -ForegroundColor Cyan
     Write-Host "Maximum wait time: $MaxWaitMinutes minutes" -ForegroundColor Yellow
@@ -396,6 +401,7 @@ function Wait-ForUpdateJobs {
 
     # Job-start retry tracking (for machines that passed Phase 1 but never ran their task)
     $waitingStartTime   = @{}  # first time each machine entered "Waiting to start"
+    $runningStartTime   = @{}  # first time each machine entered "Running" (stall detection)
     $jobStartRetryCount = @{}  # cumulative retry attempts per machine
 
     # Visual separator — everything above this line is preserved across refreshes
@@ -601,12 +607,36 @@ function Wait-ForUpdateJobs {
                 $completedComputers[$computer.Name] = $true
                 $computerStatus[$computer.Name] = "Completed"
                 $completed++
+                # Clear stall timers
+                $runningStartTime.Remove($computer.Name) 2>$null
+                $waitingStartTime.Remove($computer.Name) 2>$null
             } elseif ($jobStatus.TasksRunning -or $jobStatus.JobsRunning -or $jobStatus.UpdateProcessesRunning) {
                 $runningWhat = @()
                 if ($jobStatus.TasksRunning)           { $runningWhat += "Tasks" }
                 if ($jobStatus.JobsRunning)            { $runningWhat += "Jobs" }
                 if ($jobStatus.UpdateProcessesRunning) { $runningWhat += "Processes" }
-                Write-Host "  ⏳ $($computer.Name): Running ($($runningWhat -join ', '))" -ForegroundColor Yellow
+
+                # Track running duration for stall detection
+                if (-not $runningStartTime.ContainsKey($computer.Name)) {
+                    $runningStartTime[$computer.Name] = Get-Date
+                }
+                $runningMinutes = [int]((Get-Date) - $runningStartTime[$computer.Name]).TotalMinutes
+
+                # Auto-release if running far too long without completing
+                if ($runningMinutes -ge ($RunningStallMinutes * 2)) {
+                    Write-Host "  ⛔ $($computer.Name): Stalled for ${runningMinutes}m ($($runningWhat -join ', ')) — releasing" -ForegroundColor Red
+                    $computerStatus[$computer.Name] = "Stalled"
+                    $completedComputers[$computer.Name] = $true
+                    $completed++
+                    continue
+                }
+
+                # Warn if approaching stall threshold
+                if ($runningMinutes -ge $RunningStallMinutes) {
+                    Write-Host "  ⏳ $($computer.Name): Running ($($runningWhat -join ', ')) — ${runningMinutes}m, may be stalled" -ForegroundColor Yellow
+                } else {
+                    Write-Host "  ⏳ $($computer.Name): Running ($($runningWhat -join ', '))" -ForegroundColor Yellow
+                }
                 $computerStatus[$computer.Name] = "Running"
                 $stillRunning++
             } elseif ($jobStatus.LogExists -and -not $jobStatus.LogComplete) {
@@ -615,8 +645,14 @@ function Wait-ForUpdateJobs {
                 $stillRunning++
             } else {
                 # Track elapsed wait time for this machine
+                # If previously "Running", credit that time toward the waiting threshold
                 if (-not $waitingStartTime.ContainsKey($computer.Name)) {
-                    $waitingStartTime[$computer.Name] = Get-Date
+                    if ($runningStartTime.ContainsKey($computer.Name)) {
+                        $waitingStartTime[$computer.Name] = $runningStartTime[$computer.Name]
+                        $runningStartTime.Remove($computer.Name)
+                    } else {
+                        $waitingStartTime[$computer.Name] = Get-Date
+                    }
                 }
                 $waitingMinutes = [int]((Get-Date) - $waitingStartTime[$computer.Name]).TotalMinutes
 
@@ -945,7 +981,7 @@ $collectableComputers = @()
 foreach ($computer in $computers) {
     $computerName = $computer.Name
     $status = $monitoringResults.Status[$computerName]
-    if ($status -eq "JobStartFailed") {
+    if ($status -in @("JobStartFailed", "Stalled")) {
         $skipComputers += $computer
     } elseif (-not $monitoringResults.Completed[$computerName]) {
         $incompleteComputers += $computer
@@ -954,14 +990,24 @@ foreach ($computer in $computers) {
     }
 }
 
-# Handle JobStartFailed computers immediately (no remote work needed)
+# Handle JobStartFailed / Stalled computers immediately (no remote work needed)
 foreach ($computer in $skipComputers) {
-    $phase1Error = ($jobResults | Where-Object { $_.Site -eq $computer.Name } | Select-Object -First 1).Error
-    $errMsg = if ($phase1Error) { "Job did not start: $phase1Error" } else { "Job did not start" }
-    Write-Host "[$($computer.Name)] " -NoNewline
-    Write-Host "JobStartFailed — $errMsg" -ForegroundColor DarkYellow
+    $skipStatus = $monitoringResults.Status[$computer.Name]
+    if ($skipStatus -eq "Stalled") {
+        $errMsg = "Update processes ran but never completed (stalled)"
+        Write-Host "[$($computer.Name)] " -NoNewline
+        Write-Host "Stalled — $errMsg" -ForegroundColor DarkYellow
+    } else {
+        $phase1Error = ($jobResults | Where-Object { $_.Site -eq $computer.Name } | Select-Object -First 1).Error
+        $errMsg = if ($phase1Error) { "Job did not start: $phase1Error" } else { "Job did not start" }
+        Write-Host "[$($computer.Name)] " -NoNewline
+        Write-Host "JobStartFailed — $errMsg" -ForegroundColor DarkYellow
+        $skipStatus = "JobStartFailed"
+    }
     $computerSummary += [PSCustomObject]@{
-        ComputerName = $computer.Name; IP = $computer.IP; Status = "JobStartFailed"
+        ComputerName = $computer.Name; IP = $computer.IP
+        MachineHostname = ""; AllIPAddresses = ""
+        Status = $skipStatus
         TotalUpdates = 0; Installed = 0; Failed = 0; Skipped = 0; InstalledWithErrors = 0
         RebootRequired = $false; CollectionError = $errMsg; PreviousRunArchive = ""
     }
@@ -1366,7 +1412,7 @@ if ($installedHotfixData.Count -gt 0) {
 # Re-run CSV: computers that need another pass (real failures or did not complete)
 $rerunList = $computerSummary | Where-Object {
     $_.Failed -gt 0 -or
-    $_.Status -in @('Incomplete', 'CollectionFailed', 'Unreachable', 'Ignored-WSMAN', 'JobStartFailed', 'Inconclusive')
+    $_.Status -in @('Incomplete', 'CollectionFailed', 'Unreachable', 'Ignored-WSMAN', 'JobStartFailed', 'Stalled', 'Inconclusive')
 }
 if ($rerunList) {
     $rerunCsvPath = Join-Path $sessionReportPath "rerun_computers.csv"
@@ -1700,7 +1746,7 @@ if ($computersWithFailures.Count -gt 0) {
 "@
 }
 
-$computersWithConnectionFailures = $computerSummary | Where-Object { $_.Status -eq "Ignored-WSMAN" -or $_.Status -eq "Incomplete" -or $_.Status -eq "CollectionFailed" -or $_.Status -eq "JobStartFailed" } | Sort-Object ComputerName
+$computersWithConnectionFailures = $computerSummary | Where-Object { $_.Status -eq "Ignored-WSMAN" -or $_.Status -eq "Incomplete" -or $_.Status -eq "CollectionFailed" -or $_.Status -eq "JobStartFailed" -or $_.Status -eq "Stalled" } | Sort-Object ComputerName
 if ($computersWithConnectionFailures.Count -gt 0) {
     $html += @"
     <div class="alert-banner connection">
@@ -1719,6 +1765,7 @@ if ($computersWithConnectionFailures.Count -gt 0) {
             "Incomplete"       { "Incomplete" }
             "CollectionFailed" { "Collection failed" }
             "JobStartFailed"   { "Job start failed" }
+            "Stalled"          { "Stalled (processes hung)" }
             default            { $cc.Status }
         }
         $html += "            <span class=`"alert-chip conn`" onclick=`"scrollToComputer('$cn')`">$safeName &mdash; $statusReason</span>`n"
@@ -1837,7 +1884,7 @@ foreach ($summary in $computerSummary | Sort-Object @{Expression={if([int]$_.Fai
     $cleanName = $computerName -replace '[^a-zA-Z0-9]', '_'
     $safeComputerName = ConvertTo-HtmlEncoded $computerName
     $hasFailures = [int]$summary.Failed -gt 0
-    $isUnreachable = $summary.Status -in @("Ignored-WSMAN", "Incomplete", "CollectionFailed", "JobStartFailed", "Inconclusive")
+    $isUnreachable = $summary.Status -in @("Ignored-WSMAN", "Incomplete", "CollectionFailed", "JobStartFailed", "Stalled", "Inconclusive")
 
     $statusBadge = switch ($summary.Status) {
         "Completed"        { '<span class="badge-sm status-ok">Completed</span>' }
@@ -1847,6 +1894,7 @@ foreach ($summary in $computerSummary | Sort-Object @{Expression={if([int]$_.Fai
         "Ignored-WSMAN"    { '<span class="badge-sm status-fail">Unreachable</span>' }
         "CollectionFailed" { '<span class="badge-sm status-fail">Collection Failed</span>' }
         "JobStartFailed"   { '<span class="badge-sm status-fail">Job Failed</span>' }
+        "Stalled"          { '<span class="badge-sm status-fail">Stalled</span>' }
         default            { "<span class=`"badge-sm status-warn`">$($summary.Status)</span>" }
     }
 
@@ -2136,7 +2184,7 @@ $null = $html += @"
             for (let i = 0; i < rows.length; i += 2) {
                 pairs.push({ row: rows[i], detail: rows[i+1] });
             }
-            const priority = { 'Failed':1, 'JobStartFailed':2, 'CollectionFailed':3, 'Incomplete':4, 'Ignored-WSMAN':5, 'Completed':6, 'NoUpdatesNeeded':7 };
+            const priority = { 'Failed':1, 'Stalled':2, 'JobStartFailed':3, 'CollectionFailed':4, 'Incomplete':5, 'Ignored-WSMAN':6, 'Completed':7, 'NoUpdatesNeeded':8 };
             pairs.sort((a, b) => {
                 const as = a.row.getAttribute('data-status') || '';
                 const bs = b.row.getAttribute('data-status') || '';

@@ -213,6 +213,7 @@ Phase 3 uses batched operations for fast collection across large fleets:
 | PSWindowsUpdate errors | Install on remote: `Install-Module PSWindowsUpdate -Force` |
 | Defender updates show as Failed | Expected — Defender self-updates; script marks these as Skipped |
 | Jobs stuck in "Waiting" | Script auto-retries after 30 min; check remote `C:\temp` for artifacts |
+| Machine stuck "Running (Processes)" | Stall detection warns at 15 min, auto-releases at 30 min as "Stalled" — machine goes to rerun list. Time spent in "Running" carries over if it transitions to "Waiting" |
 | Double-hop auth failures | Script uses `Copy-Item -FromSession` to avoid double-hop issues |
 | Status shows "Inconclusive" | Empty update log without completion marker — job may have crashed; re-run |
 | Verified shows "Pending" | Update installed but not yet in hotfix list — machine needs reboot |
